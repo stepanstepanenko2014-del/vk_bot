@@ -1,3 +1,4 @@
+#!/usr/bin/env python3.11
 from dotenv import load_dotenv
 load_dotenv()
 
