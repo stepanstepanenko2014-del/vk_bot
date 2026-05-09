@@ -1,75 +1,63 @@
 import os
 import json
-import psycopg2
-from psycopg2.extras import RealDictCursor
+import requests
 from datetime import datetime, timedelta
 
-DATABASE_URL = os.getenv("DATABASE_URL")
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+
+HEADERS = {
+    "apikey": SUPABASE_KEY,
+    "Authorization": f"Bearer {SUPABASE_KEY}",
+    "Content-Type": "application/json",
+    "Prefer": "return=minimal"
+}
 
 
-def get_conn():
-    return psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
+def db_get():
+    try:
+        r = requests.get(
+            f"{SUPABASE_URL}/rest/v1/bot_data?key=eq.main&select=value",
+            headers=HEADERS
+        )
+        rows = r.json()
+        if rows:
+            data = json.loads(rows[0]["value"])
+            data.setdefault("bans", {})
+            data.setdefault("gbans", {})
+            data.setdefault("networks", {})
+            data.setdefault("admins", {})
+            data.setdefault("moderators", {})
+            data.setdefault("warnings", {})
+            data.setdefault("messages", {})
+            data.setdefault("chat_types", {})
+            return data
+    except Exception as e:
+        print(f"[DB] get error: {e}")
+    return {
+        "messages": {}, "moderators": {}, "warnings": {},
+        "networks": {}, "admins": {}, "bans": {}, "gbans": {}, "chat_types": {}
+    }
 
 
-def init_db():
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS bot_data (
-                    key TEXT PRIMARY KEY,
-                    value TEXT NOT NULL
-                )
-            """)
-        conn.commit()
+def db_save(data):
+    try:
+        payload = {"key": "main", "value": json.dumps(data, ensure_ascii=False)}
+        r = requests.post(
+            f"{SUPABASE_URL}/rest/v1/bot_data",
+            headers={**HEADERS, "Prefer": "resolution=merge-duplicates"},
+            json=payload
+        )
+    except Exception as e:
+        print(f"[DB] save error: {e}")
 
 
 class Storage:
     def __init__(self):
-        init_db()
-        self.data = self._load()
-
-    def _load(self):
-        try:
-            with get_conn() as conn:
-                with conn.cursor() as cur:
-                    cur.execute("SELECT value FROM bot_data WHERE key = 'main'")
-                    row = cur.fetchone()
-                    if row:
-                        data = json.loads(row["value"])
-                        data.setdefault("bans", {})
-                        data.setdefault("gbans", {})
-                        data.setdefault("networks", {})
-                        data.setdefault("admins", {})
-                        data.setdefault("moderators", {})
-                        data.setdefault("warnings", {})
-                        data.setdefault("messages", {})
-                        data.setdefault("chat_types", {})
-                        return data
-        except Exception as e:
-            print(f"[DB] load error: {e}")
-        return {
-            "messages": {},
-            "moderators": {},
-            "warnings": {},
-            "networks": {},
-            "admins": {},
-            "bans": {},
-            "gbans": {},
-            "chat_types": {}
-        }
+        self.data = db_get()
 
     def _save(self):
-        try:
-            with get_conn() as conn:
-                with conn.cursor() as cur:
-                    cur.execute("""
-                        INSERT INTO bot_data (key, value)
-                        VALUES ('main', %s)
-                        ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
-                    """, (json.dumps(self.data, ensure_ascii=False),))
-                conn.commit()
-        except Exception as e:
-            print(f"[DB] save error: {e}")
+        db_save(self.data)
 
     # ── Сообщения ──
     def count_message(self, user_id: int, peer_id: int):
@@ -109,11 +97,8 @@ class Storage:
                 last_time = lt
 
         return {
-            "total": total,
-            "today": today_count,
-            "week": week_count,
-            "month": month_count,
-            "last_time": last_time
+            "total": total, "today": today_count,
+            "week": week_count, "month": month_count, "last_time": last_time
         }
 
     def get_user_stats_in_chat(self, user_id: int, peer_id: int):
