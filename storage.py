@@ -32,13 +32,14 @@ def db_get():
             data.setdefault("messages", {})
             data.setdefault("chat_types", {})
             data.setdefault("mutes", {})
+            data.setdefault("beer", {})
             return data
     except Exception as e:
         print(f"[DB] get error: {e}")
     return {
         "messages": {}, "moderators": {}, "warnings": {},
         "networks": {}, "admins": {}, "bans": {}, "gbans": {},
-        "chat_types": {}, "mutes": {}
+        "chat_types": {}, "mutes": {}, "beer": {}
     }
 
 
@@ -312,14 +313,11 @@ class Storage:
     def add_mute(self, user_id: int, peer_id: int, until: str, reason: str, by_name: str):
         uid = str(user_id)
         self.data["mutes"].setdefault(uid, [])
-        # Деактивируем старые муты в этой беседе
         for m in self.data["mutes"][uid]:
             if m["peer_id"] == peer_id and m.get("active"):
                 m["active"] = False
         self.data["mutes"][uid].append({
-            "peer_id": peer_id,
-            "until": until,
-            "reason": reason,
+            "peer_id": peer_id, "until": until, "reason": reason,
             "by_name": by_name,
             "date": datetime.now().strftime("%d/%m/%Y %H:%M:%S"),
             "active": True
@@ -346,3 +344,35 @@ class Storage:
 
     def get_all_mutes(self):
         return self.data.get("mutes", {})
+
+    # ── Пиво ──
+    def add_beer(self, user_id: int, amount: float):
+        uid = str(user_id)
+        month = datetime.now().strftime("%Y-%m")
+        self.data["beer"].setdefault(uid, {"total": 0, "month": {}, "last_time": None})
+        self.data["beer"][uid]["total"] = round(self.data["beer"][uid].get("total", 0) + amount, 1)
+        self.data["beer"][uid]["month"][month] = round(
+            self.data["beer"][uid]["month"].get(month, 0) + amount, 1
+        )
+        self.data["beer"][uid]["last_time"] = datetime.now().strftime("%Y-%m-%d %H:%M")
+        self._save()
+
+    def get_beer(self, user_id: int) -> dict:
+        return self.data["beer"].get(str(user_id), {"total": 0, "month": {}, "last_time": None})
+
+    def get_beer_last_time(self, user_id: int):
+        return self.data["beer"].get(str(user_id), {}).get("last_time")
+
+    def get_beer_top(self, month: str = None) -> list:
+        if month is None:
+            month = datetime.now().strftime("%Y-%m")
+        result = []
+        for uid, data in self.data["beer"].items():
+            amount = data.get("month", {}).get(month, 0)
+            if amount > 0:
+                result.append({"user_id": int(uid), "amount": amount})
+        return sorted(result, key=lambda x: x["amount"], reverse=True)
+
+    def reset_beer(self):
+        self.data["beer"] = {}
+        self._save()
