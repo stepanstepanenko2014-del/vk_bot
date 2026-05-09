@@ -1,25 +1,52 @@
-import json, os
+import os
+import json
+import psycopg2
+from psycopg2.extras import RealDictCursor
 from datetime import datetime, timedelta
 
-DATA_FILE = "data.json"
+DATABASE_URL = os.getenv("DATABASE_URL")
+
+
+def get_conn():
+    return psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
+
+
+def init_db():
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS bot_data (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                )
+            """)
+        conn.commit()
+
 
 class Storage:
     def __init__(self):
+        init_db()
         self.data = self._load()
 
     def _load(self):
-        if os.path.exists(DATA_FILE):
-            with open(DATA_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-                data.setdefault("bans", {})
-                data.setdefault("gbans", {})
-                data.setdefault("networks", {})
-                data.setdefault("admins", {})
-                data.setdefault("moderators", {})
-                data.setdefault("warnings", {})
-                data.setdefault("messages", {})
-                data.setdefault("chat_types", {})  # peer_id -> "moder"/"chat"
-                return data
+        try:
+            with get_conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT value FROM bot_data WHERE key = 'main'")
+                    row = cur.fetchone()
+                    if row:
+                        data = json.loads(row["value"])
+                        data.setdefault("bans", {})
+                        data.setdefault("gbans", {})
+                        data.setdefault("networks", {})
+                        data.setdefault("admins", {})
+                        data.setdefault("moderators", {})
+                        data.setdefault("warnings", {})
+                        data.setdefault("messages", {})
+                        data.setdefault("chat_types", {})
+                        return data
+        except Exception as e:
+            print(f"[DB] load error: {e}")
         return {
             "messages": {},
             "moderators": {},
@@ -32,8 +59,17 @@ class Storage:
         }
 
     def _save(self):
-        with open(DATA_FILE, "w", encoding="utf-8") as f:
-            json.dump(self.data, f, ensure_ascii=False, indent=2)
+        try:
+            with get_conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("""
+                        INSERT INTO bot_data (key, value)
+                        VALUES ('main', %s)
+                        ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
+                    """, (json.dumps(self.data, ensure_ascii=False),))
+                conn.commit()
+        except Exception as e:
+            print(f"[DB] save error: {e}")
 
     # ── Сообщения ──
     def count_message(self, user_id: int, peer_id: int):
@@ -151,7 +187,6 @@ class Storage:
 
     # ── Типы бесед ──
     def set_chat_type(self, peer_id: int, chat_type: str):
-        """chat_type: 'moder' или 'chat'"""
         self.data["chat_types"][str(peer_id)] = chat_type
         self._save()
 
@@ -159,7 +194,6 @@ class Storage:
         return self.data["chat_types"].get(str(peer_id), "chat")
 
     def get_moder_chats_in_network(self, peer_id: int) -> list:
-        """Возвращает все беседы типа 'moder' в сетке текущей беседы."""
         _, net_chats = self.find_network_by_chat(peer_id)
         if not net_chats:
             return []
@@ -168,9 +202,7 @@ class Storage:
     # ── Модераторы ──
     def set_moderator(self, user_id: int, nick: str, role: str, position: str):
         self.data["moderators"][str(user_id)] = {
-            "nick": nick,
-            "role": role,
-            "position": position,
+            "nick": nick, "role": role, "position": position,
             "added": datetime.now().strftime("%Y-%m-%d %H:%M")
         }
         self._save()
@@ -192,8 +224,7 @@ class Storage:
     # ── Администраторы ──
     def add_admin(self, user_id: int, nick: str, added_by: int):
         self.data["admins"][str(user_id)] = {
-            "nick": nick,
-            "added_by": added_by,
+            "nick": nick, "added_by": added_by,
             "added": datetime.now().strftime("%Y-%m-%d %H:%M")
         }
         self._save()
@@ -216,8 +247,7 @@ class Storage:
     def add_warning(self, user_id: int, reason: str, issued_by: int, issued_by_name: str):
         uid = str(user_id)
         self.data["warnings"].setdefault(uid, []).append({
-            "reason": reason,
-            "issued_by": issued_by,
+            "reason": reason, "issued_by": issued_by,
             "issued_by_name": issued_by_name,
             "date": datetime.now().strftime("%Y-%m-%d %H:%M"),
             "active": True
@@ -241,21 +271,16 @@ class Storage:
                 term: str, by: int, by_name: str, is_gban: bool = False):
         uid = str(user_id)
         self.data["bans"].setdefault(uid, []).append({
-            "peer_id": peer_id,
-            "reason": reason,
-            "term": term or "Навсегда",
-            "by": by,
-            "by_name": by_name,
+            "peer_id": peer_id, "reason": reason,
+            "term": term or "Навсегда", "by": by, "by_name": by_name,
             "date": datetime.now().strftime("%d/%m/%Y %H:%M:%S"),
-            "active": True,
-            "gban": is_gban
+            "active": True, "gban": is_gban
         })
         self._save()
 
     def add_gban(self, user_id: int, reason: str, by_name: str):
         self.data["gbans"][str(user_id)] = {
-            "reason": reason,
-            "by_name": by_name,
+            "reason": reason, "by_name": by_name,
             "date": datetime.now().strftime("%d/%m/%Y %H:%M:%S"),
             "active": True
         }
