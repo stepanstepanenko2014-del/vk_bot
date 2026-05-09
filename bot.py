@@ -138,6 +138,9 @@ def webhook():
 def health():
     return "Bot is running", 200
 
+@app.route("/ping", methods=["GET"])
+def ping():
+    return "pong", 200
 
 if __name__ == "__main__":
     print("[BOT] Starting...")
