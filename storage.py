@@ -31,12 +31,14 @@ def db_get():
             data.setdefault("warnings", {})
             data.setdefault("messages", {})
             data.setdefault("chat_types", {})
+            data.setdefault("mutes", {})
             return data
     except Exception as e:
         print(f"[DB] get error: {e}")
     return {
         "messages": {}, "moderators": {}, "warnings": {},
-        "networks": {}, "admins": {}, "bans": {}, "gbans": {}, "chat_types": {}
+        "networks": {}, "admins": {}, "bans": {}, "gbans": {},
+        "chat_types": {}, "mutes": {}
     }
 
 
@@ -305,3 +307,42 @@ class Storage:
     def count_banned_chats(self, user_id: int) -> int:
         peers = set(b["peer_id"] for b in self.get_bans(user_id) if not b.get("gban"))
         return len(peers)
+
+    # ── Муты ──
+    def add_mute(self, user_id: int, peer_id: int, until: str, reason: str, by_name: str):
+        uid = str(user_id)
+        self.data["mutes"].setdefault(uid, [])
+        # Деактивируем старые муты в этой беседе
+        for m in self.data["mutes"][uid]:
+            if m["peer_id"] == peer_id and m.get("active"):
+                m["active"] = False
+        self.data["mutes"][uid].append({
+            "peer_id": peer_id,
+            "until": until,
+            "reason": reason,
+            "by_name": by_name,
+            "date": datetime.now().strftime("%d/%m/%Y %H:%M:%S"),
+            "active": True
+        })
+        self._save()
+
+    def remove_mute(self, user_id: int, peer_id: int):
+        uid = str(user_id)
+        changed = False
+        for m in self.data["mutes"].get(uid, []):
+            if m["peer_id"] == peer_id and m.get("active"):
+                m["active"] = False
+                changed = True
+        if changed:
+            self._save()
+        return changed
+
+    def get_mute(self, user_id: int, peer_id: int):
+        uid = str(user_id)
+        for m in self.data["mutes"].get(uid, []):
+            if m["peer_id"] == peer_id and m.get("active"):
+                return m
+        return None
+
+    def get_all_mutes(self):
+        return self.data.get("mutes", {})
