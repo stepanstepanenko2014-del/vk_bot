@@ -1,9 +1,8 @@
-import re, os
+import re, os, random
 from datetime import datetime, timedelta
 
 OWNER_ID = int(os.getenv("OWNER_ID", "0"))
 
-# Полная иерархия
 HIERARCHY = {
     "Специальный руководитель": 110,
     "Заместитель специального руководителя": 100,
@@ -42,6 +41,13 @@ STAFF_POSITIONS = [
     "Модератор",
     "Младший модератор",
 ]
+
+MONTH_NAMES = {
+    "01": "January", "02": "February", "03": "March",
+    "04": "April", "05": "May", "06": "June",
+    "07": "July", "08": "August", "09": "September",
+    "10": "October", "11": "November", "12": "December"
+}
 
 
 def make_mention(user_id: int, name: str = None) -> str:
@@ -88,18 +94,15 @@ def can_assign(from_user_id: int, target_position: str, storage, owner_id: int) 
 
 
 def parse_duration(text: str):
-    """Парсит срок мута. Возвращает (минуты, текст_срока, остаток)"""
     m = re.match(
         r"^(\d+)\s*(мин|минут|минуты|м|ч|час|часов|д|день|дней|дн)\s*",
         text.strip(), re.IGNORECASE
     )
     if not m:
         return None, None, text
-
     amount = int(m.group(1))
     unit = m.group(2).lower()
     rest = text[m.end():].strip()
-
     if unit in ("мин", "минут", "минуты", "м"):
         minutes = amount
         label = f"{amount} мин."
@@ -111,7 +114,6 @@ def parse_duration(text: str):
         label = f"{amount} дн."
     else:
         return None, None, text
-
     return minutes, label, rest
 
 
@@ -136,35 +138,90 @@ def handle_command(text, from_user_id, peer_id, storage, vk, get_user_name,
         return f"✅ {make_mention(user_id, nick)} назначен: {position}"
 
     # ══════════════════════════════════════
+    #   /пиво
+    # ══════════════════════════════════════
+    if cmd in ("/пиво", "!пиво", "/beer", "!beer"):
+        last = storage.get_beer_last_time(from_user_id)
+        if last:
+            last_dt = datetime.strptime(last, "%Y-%m-%d %H:%M")
+            diff = datetime.now() - last_dt
+            if diff.total_seconds() < 3600:
+                remaining = 3600 - int(diff.total_seconds())
+                mins = remaining // 60
+                secs = remaining % 60
+                return f"🍺 Ещё не время! Следующая попытка через {mins} мин. {secs} сек."
+
+        amount = round(random.uniform(0.1, 3.0), 1)
+        storage.add_beer(from_user_id, amount)
+
+        beer_data = storage.get_beer(from_user_id)
+        month = datetime.now().strftime("%Y-%m")
+        month_amount = beer_data["month"].get(month, 0)
+
+        mod = storage.get_moderator(from_user_id)
+        name = mod["nick"] if mod else get_user_name(from_user_id)
+
+        return (
+            f"🍺 {make_mention(from_user_id, name)}, ты выпил {amount} литра пива!\n\n"
+            f"Выпито за месяц — {month_amount} л. 🍺\n"
+            f"Следующая попытка через час."
+        )
+
+    # ══════════════════════════════════════
+    #   /пивозавры
+    # ══════════════════════════════════════
+    if cmd in ("/пивозавры", "!пивозавры", "/beertop", "!beertop"):
+        month = datetime.now().strftime("%Y-%m")
+        month_num = month.split("-")[1]
+        month_name = MONTH_NAMES.get(month_num, month)
+        top = storage.get_beer_top(month)
+
+        if not top:
+            return "🍺 Никто ещё не пил пиво в этом месяце!"
+
+        lines = [f"🍺 Топ пивозавров за {month_name} {datetime.now().year}:\n"]
+        for i, entry in enumerate(top[:15], 1):
+            uid = entry["user_id"]
+            mod = storage.get_moderator(uid)
+            name = mod["nick"] if mod else get_user_name(uid)
+            lines.append(f"{i}. {make_mention(uid, name)}  Выпито — {entry['amount']} литров.")
+
+        return "\n".join(lines)
+
+    # ══════════════════════════════════════
+    #   /обнулитьпиво
+    # ══════════════════════════════════════
+    if cmd in ("/обнулитьпиво", "!обнулитьпиво", "/resetbeer", "!resetbeer"):
+        if not is_owner:
+            return no_access()
+        storage.reset_beer()
+        return "✅ Статистика пива обнулена."
+
+    # ══════════════════════════════════════
     #   /мут
     # ══════════════════════════════════════
     if cmd in ("/мут", "!мут", "/mute", "!mute"):
         if not is_moder and not is_owner:
             return no_access()
-
         target_id, rest = resolve_target(args, reply_user_id)
         if not target_id:
             return "❌ Укажи пользователя."
-
         minutes, label, reason = parse_duration(rest)
         if not minutes:
             return "❌ Формат: /мут [цель] [срок] [причина]\nПример: /мут @ник 30 мин оффтоп"
-
         reason = reason.strip() or "Без причины"
         until = (datetime.now() + timedelta(minutes=minutes)).strftime("%d/%m/%Y %H:%M:%S")
-
         mod = storage.get_moderator(from_user_id)
         by_label = mod["nick"] if mod else get_user_name(from_user_id)
         target_mod = storage.get_moderator(target_id)
         target_label = target_mod["nick"] if target_mod else get_user_name(target_id)
-
         storage.add_mute(target_id, peer_id, until, reason, by_label)
-
-        lines = [f"🔇 {make_mention(target_id, target_label)} замучен"]
-        lines.append(f"Причина: {reason}")
-        lines.append(f"Мут выдан до: {until}")
-        lines.append(f"Выдал: {by_label}")
-        return "\n".join(lines)
+        return (
+            f"🔇 {make_mention(target_id, target_label)} замучен\n"
+            f"Причина: {reason}\n"
+            f"Мут выдан до: {until}\n"
+            f"Выдал: {by_label}"
+        )
 
     # ══════════════════════════════════════
     #   /размут
@@ -172,11 +229,9 @@ def handle_command(text, from_user_id, peer_id, storage, vk, get_user_name,
     if cmd in ("/размут", "!размут", "/unmute", "!unmute"):
         if not is_moder and not is_owner:
             return no_access()
-
         target_id, _ = resolve_target(args, reply_user_id)
         if not target_id:
             return "❌ Укажи пользователя."
-
         if storage.remove_mute(target_id, peer_id):
             target_mod = storage.get_moderator(target_id)
             name = target_mod["nick"] if target_mod else get_user_name(target_id)
@@ -212,7 +267,7 @@ def handle_command(text, from_user_id, peer_id, storage, vk, get_user_name,
             return "❌ Пользователь не в системе."
         vk_name = get_user_name(target_id)
         storage.set_moderator(target_id, vk_name, existing["role"], existing["position"])
-        return f"✅ Ник сброшен"
+        return "✅ Ник сброшен"
 
     if cmd in ("/delstaff", "!delstaff"):
         if not is_owner:
@@ -251,16 +306,14 @@ def handle_command(text, from_user_id, peer_id, storage, vk, get_user_name,
         return set_user_position(target_id, position)
 
     # ══════════════════════════════════════
-    #   /ban
+    #   /ban, /unban, /kick
     # ══════════════════════════════════════
     if cmd in ("/ban", "!ban"):
         if not is_moder and not is_owner:
             return no_access()
-
         target_id, rest = resolve_target(args, reply_user_id)
         if not target_id:
             return "❌ Укажи пользователя."
-
         term = "Навсегда"
         reason = rest.strip()
         term_match = re.match(
@@ -270,23 +323,19 @@ def handle_command(text, from_user_id, peer_id, storage, vk, get_user_name,
         if term_match:
             term = term_match.group(1).strip()
             reason = rest[term_match.end():].strip()
-
         if not reason:
             return "❌ Укажи причину бана."
-
         mod = storage.get_moderator(from_user_id)
         by_label = mod["nick"] if mod else get_user_name(from_user_id)
-
         try:
             vk.messages.removeChatUser(chat_id=peer_id - 2000000000, user_id=target_id)
         except Exception as e:
             print(f"[WARN] kick: {e}")
-
         storage.add_ban(target_id, peer_id, reason, term, from_user_id, by_label)
         target_mod = storage.get_moderator(target_id)
         target_label = target_mod["nick"] if target_mod else get_user_name(target_id)
-
-        return f"🔨 {make_mention(target_id, target_label)} заблокирован\nПричина: {reason}\nСрок: {term}\nВыдал: {by_label}"
+        return (f"🔨 {make_mention(target_id, target_label)} заблокирован\n"
+                f"Причина: {reason}\nСрок: {term}\nВыдал: {by_label}")
 
     if cmd in ("/unban", "!unban"):
         if not is_moder and not is_owner:
@@ -312,8 +361,12 @@ def handle_command(text, from_user_id, peer_id, storage, vk, get_user_name,
         by_label = mod["nick"] if mod else get_user_name(from_user_id)
         target_mod = storage.get_moderator(target_id)
         target_label = target_mod["nick"] if target_mod else get_user_name(target_id)
-        return f"👢 {make_mention(target_id, target_label)} кикнут\nПричина: {reason}\nВыдал: {by_label}"
+        return (f"👢 {make_mention(target_id, target_label)} кикнут\n"
+                f"Причина: {reason}\nВыдал: {by_label}")
 
+    # ══════════════════════════════════════
+    #   /gban, /ungban
+    # ══════════════════════════════════════
     if cmd in ("/gban", "!gban"):
         if not is_owner:
             return no_access()
@@ -331,14 +384,16 @@ def handle_command(text, from_user_id, peer_id, storage, vk, get_user_name,
                 continue
             try:
                 vk.messages.removeChatUser(chat_id=pid - 2000000000, user_id=target_id)
-                storage.add_ban(target_id, pid, reason, "Глобальный бан", from_user_id, by_name, is_gban=True)
+                storage.add_ban(target_id, pid, reason, "Глобальный бан",
+                                from_user_id, by_name, is_gban=True)
                 kicked += 1
             except Exception as e:
                 print(f"[WARN] gban {pid}: {e}")
         storage.add_gban(target_id, reason, by_name)
         target_mod = storage.get_moderator(target_id)
         target_label = target_mod["nick"] if target_mod else get_user_name(target_id)
-        return f"🌐 Глобальный бан: {make_mention(target_id, target_label)}\nПричина: {reason}\nКикнут из {kicked} бесед"
+        return (f"🌐 Глобальный бан: {make_mention(target_id, target_label)}\n"
+                f"Причина: {reason}\nКикнут из {kicked} бесед")
 
     if cmd in ("/ungban", "!ungban"):
         if not is_owner:
@@ -350,6 +405,9 @@ def handle_command(text, from_user_id, peer_id, storage, vk, get_user_name,
             return "✅ Глобальный бан снят"
         return "❌ Бан не найден"
 
+    # ══════════════════════════════════════
+    #   /checkban
+    # ══════════════════════════════════════
     if cmd in ("/checkban", "!checkban", "/чекбан", "!чекбан"):
         if not is_moder and not is_owner:
             return no_access()
@@ -366,23 +424,23 @@ def handle_command(text, from_user_id, peer_id, storage, vk, get_user_name,
         recent_bans = [b for b in all_bans if not b.get("gban")][-10:]
 
         lines = [f"Информация о блокировках {make_mention(target_id, target_label)}\n"]
-        lines.append(f"Общая блокировка в чатах JORDANS: {'🔴 ' + gban['reason'] if gban else '✅ отсутствует'}")
+        lines.append(f"Общая блокировка JORDANS: {'🔴 ' + gban['reason'] if gban else '✅ отсутствует'}")
         if gban:
             lines.append(f"Выдал: {gban['by_name']} | {gban['date']}")
         lines.append("")
         if chat_bans:
             b = chat_bans[-1]
-            lines.append(f"Блокировка в беседе игроков: 🔴 {b['reason']}")
+            lines.append(f"Блокировка в беседе: 🔴 {b['reason']}")
             lines.append(f"Срок: {b['term']} | Выдал: {b['by_name']} | {b['date']}")
         else:
-            lines.append("Блокировка в беседе игроков: ✅ отсутствует")
+            lines.append("Блокировка в беседе: ✅ отсутствует")
         lines.append("")
-        lines.append(f"Количество бесед, в которых заблокирован: {banned_chats_count}")
+        lines.append(f"Заблокирован в {banned_chats_count} беседах")
         if recent_bans:
             lines.append(f"\nПоследние блокировки ({len(recent_bans)}):\n")
             for i, b in enumerate(reversed(recent_bans), 1):
                 issuer_mod = storage.get_moderator(b["by"])
-                mod_info = f" | {issuer_mod['role']} | {issuer_mod['position']}" if issuer_mod else ""
+                mod_info = f" | {issuer_mod['position']}" if issuer_mod else ""
                 lines.append(f"{i}) {b['by_name']}{mod_info} | {b['reason']} | {b['term']} | {b['date']}")
         return "\n".join(lines)
 
@@ -439,7 +497,6 @@ def handle_command(text, from_user_id, peer_id, storage, vk, get_user_name,
     if cmd in ("/mstats", "!mstats", "/мстатс", "!мстатс"):
         if not is_moder and not is_owner:
             return no_access()
-
         target_id, _ = resolve_target(args, reply_user_id)
         if not target_id:
             target_id = from_user_id
@@ -447,7 +504,6 @@ def handle_command(text, from_user_id, peer_id, storage, vk, get_user_name,
         net_name, net_chats = storage.find_network_by_chat(peer_id)
         peer_ids = net_chats if net_chats else None
         stats_net = storage.get_user_stats(target_id, peer_ids)
-        stats_chat = storage.get_user_stats_in_chat(target_id, peer_id)
         mod = storage.get_moderator(target_id)
         active_warns = storage.get_active_warnings(target_id)
         all_warns = storage.get_warnings(target_id)
@@ -461,17 +517,15 @@ def handle_command(text, from_user_id, peer_id, storage, vk, get_user_name,
 
         lines = [f"📊 Статистика {make_mention(target_id, mod['nick'] if mod else vk_name)}\n"]
         lines.append(f"Роль: {mod['position'] if mod else '—'}")
-        lines.append(f"Блокировок: {'🔴 есть' if net_bans else 'Нет'}")
-        lines.append(f"Общая блокировка в чатах: {'🔴 есть' if gban else 'Нет'}")
-        lines.append(f"Блокировка в беседах игроков: {'🔴 есть' if net_bans else 'Нет'}")
-        lines.append(f"Активные предупреждения: {len(active_warns)}/{len(all_warns)}")
-        lines.append(f"Блокировка чата: {'🔴 до ' + mute['until'] if mute else 'Нет'}")
-        lines.append(f"Ник: {mod['nick'] if mod else vk_name}")
+        lines.append(f"Общая блокировка в чатах JORDANS: {'🔴 есть' if gban else 'Нет'}")
+        lines.append(f"Общая блокировка в сетке беседы: {'🔴 есть' if net_bans else 'Нет'}")
+        lines.append(f"Активные наказания: {len(active_warns)}/{len(all_warns)}")
+        lines.append(f"Последнее наказание выдал: {all_warns[-1]['issued_by_name'] if all_warns else '—'}")
+        lines.append(f"Nick_Name: {mod['nick'] if mod else vk_name}")
         scope = f"сетка «{net_name}»" if net_name else "все беседы"
-        lines.append(f"Всего сообщений ({scope}): {stats_net['total']}")
-        lines.append(f"Сообщений за сегодня ({scope}): {stats_net['today']}")
+        lines.append(f"Всего сообщений в {scope}: {stats_net['total']}")
+        lines.append(f"Сообщений за сегодня в {scope}: {stats_net['today']}")
         lines.append(f"Последнее сообщение отправлено в: {stats_net['last_time'] or '—'}")
-
         return "\n".join(lines)
 
     # ══════════════════════════════════════
@@ -503,19 +557,16 @@ def handle_command(text, from_user_id, peer_id, storage, vk, get_user_name,
     #   /gstaff
     # ══════════════════════════════════════
     if cmd in ("/gstaff", "!gstaff", "/гстафф", "!гстафф"):
-        # Только те кто в gstaff или owner
         caller_mod = storage.get_moderator(from_user_id)
         caller_pos = caller_mod.get("position", "") if caller_mod else ""
         if not is_owner and caller_pos not in GSTAFF_POSITIONS:
             return no_access()
-
         all_mods = storage.get_all_moderators()
         staff_by_pos = {pos: [] for pos in GSTAFF_POSITIONS}
         for uid, m in all_mods.items():
             pos = m.get("position", "")
             if pos in staff_by_pos:
                 staff_by_pos[pos].append({"id": int(uid), "nick": m["nick"]})
-
         lines = ["👑 Руководство JORDANS\n"]
         for pos in GSTAFF_POSITIONS:
             people = staff_by_pos[pos]
@@ -534,14 +585,12 @@ def handle_command(text, from_user_id, peer_id, storage, vk, get_user_name,
     if cmd in ("/mstaff", "!mstaff", "/мстафф", "!мстафф"):
         if not is_moder and not is_owner:
             return no_access()
-
         all_mods = storage.get_all_moderators()
         staff_by_pos = {pos: [] for pos in MSTAFF_POSITIONS}
         for uid, m in all_mods.items():
             pos = m.get("position", "")
             if pos in staff_by_pos:
                 staff_by_pos[pos].append({"id": int(uid), "nick": m["nick"]})
-
         lines = ["🛡 Состав модерации\n"]
         for pos in MSTAFF_POSITIONS:
             people = staff_by_pos[pos]
@@ -560,14 +609,12 @@ def handle_command(text, from_user_id, peer_id, storage, vk, get_user_name,
     if cmd in ("/staff", "!staff", "/стафф", "!стафф"):
         if not is_moder and not is_owner:
             return no_access()
-
         all_mods = storage.get_all_moderators()
         staff_by_pos = {pos: [] for pos in STAFF_POSITIONS}
         for uid, m in all_mods.items():
             pos = m.get("position", "")
             if pos in staff_by_pos:
                 staff_by_pos[pos].append({"id": int(uid), "nick": m["nick"]})
-
         lines = ["👥 Состав беседы\n"]
         for pos in STAFF_POSITIONS:
             people = staff_by_pos[pos]
@@ -625,7 +672,7 @@ def handle_command(text, from_user_id, peer_id, storage, vk, get_user_name,
         if not m:
             return "❌ Формат: /delnet [название]"
         storage.delete_network(m.group(1))
-        return f"✅ Сетка удалена"
+        return "✅ Сетка удалена"
 
     if cmd in ("/nets", "!nets"):
         if not is_owner:
@@ -646,6 +693,9 @@ def handle_command(text, from_user_id, peer_id, storage, vk, get_user_name,
             return no_access()
         return (
             "📋 Команды:\n\n"
+            "🍺 Развлечения:\n"
+            "/пиво — выпить пиво (раз в час)\n"
+            "/пивозавры — топ пивоманов\n\n"
             "📊 Статистика:\n"
             "/stats [день|неделя|месяц]\n"
             "/mstats [цель]\n"
