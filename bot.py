@@ -164,7 +164,8 @@ def webhook():
     except Exception as e:
         print(f"[ERROR] webhook: {e}")
         return "ok"
-
+        if event_type == "message_event":
+            handle_callback(data)
 
 @app.route("/ping", methods=["GET"])
 def ping():
