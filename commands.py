@@ -1,4 +1,4 @@
-import re, os, random
+import re, os, random, json
 from datetime import datetime, timedelta
 from economy import (CURRENCY, VIP_PRICE, HIDE_BALANCE_PRICE, ROULETTE_MIN,
                      PRIZE_AMOUNT, PRIZE_COOLDOWN, DEPOSIT_DAYS, DEPOSIT_RATE,
@@ -90,10 +90,25 @@ def get_priority(user_id: int, storage, owner_id: int) -> int:
     return HIERARCHY.get(mod.get("position", ""), 0)
 
 
-def can_assign(from_user_id: int, target_position: str, storage, owner_id: int) -> bool:
+def can_assign(from_user_id: int, target_user_id: int, target_position: str, storage, owner_id: int) -> bool:
+    """Проверяет можно ли from назначить target на target_position.
+    Нельзя назначать тех кто выше или равен по рангу."""
     from_priority = get_priority(from_user_id, storage, owner_id)
     target_priority = HIERARCHY.get(target_position, 0)
-    return from_priority > target_priority and target_priority > 0
+    # Приоритет цели (текущая должность)
+    target_current_mod = storage.get_moderator(target_user_id)
+    target_current_priority = 0
+    if target_current_mod:
+        target_current_priority = HIERARCHY.get(target_current_mod.get("position", ""), 0)
+
+    # Нельзя назначать если цель выше или равна тебе
+    if target_current_priority >= from_priority:
+        return False
+    # Нельзя назначать на должность выше или равную своей
+    if target_priority >= from_priority:
+        return False
+    # Должность должна быть в иерархии
+    return target_priority > 0
 
 
 def parse_duration(text: str):
@@ -107,26 +122,18 @@ def parse_duration(text: str):
     unit = m.group(2).lower()
     rest = text[m.end():].strip()
     if unit in ("мин", "минут", "минуты", "м"):
-        minutes = amount
-        label = f"{amount} мин."
+        minutes, label = amount, f"{amount} мин."
     elif unit in ("ч", "час", "часов"):
-        minutes = amount * 60
-        label = f"{amount} ч."
+        minutes, label = amount * 60, f"{amount} ч."
     elif unit in ("д", "день", "дней", "дн"):
-        minutes = amount * 60 * 24
-        label = f"{amount} дн."
+        minutes, label = amount * 60 * 24, f"{amount} дн."
     else:
         return None, None, text
     return minutes, label, rest
 
 
 def send_keyboard(vk, peer_id: int, message: str, buttons: list):
-    """Отправляет сообщение с inline-кнопками."""
-    import json
-    keyboard = {
-        "inline": True,
-        "buttons": buttons
-    }
+    keyboard = {"inline": True, "buttons": buttons}
     try:
         vk.messages.send(
             peer_id=peer_id,
@@ -139,13 +146,14 @@ def send_keyboard(vk, peer_id: int, message: str, buttons: list):
 
 
 def handle_command(text, from_user_id, peer_id, storage, vk, get_user_name,
-                   stats_chat_id, reply_user_id=None):
+                   stats_chat_id, reply_user_id=None, msg=None):
     parts = text.strip().split(maxsplit=1)
     cmd = parts[0].lower()
     args = parts[1].strip() if len(parts) > 1 else ""
     is_moder = storage.get_moderator(from_user_id) is not None
     is_owner = from_user_id == OWNER_ID
     is_vip = storage.is_vip(from_user_id)
+    from_priority = get_priority(from_user_id, storage, OWNER_ID)
 
     def no_access():
         return "⛔ Нет прав."
@@ -159,96 +167,206 @@ def handle_command(text, from_user_id, peer_id, storage, vk, get_user_name,
         return f"✅ {make_mention(user_id, nick)} назначен: {position}"
 
     # ══════════════════════════════════════
+    #   /start
+    # ══════════════════════════════════════
+    if cmd in ("/start", "!start"):
+        if from_priority >= HIERARCHY.get("Руководитель сообщества", 90) or is_owner:
+            storage.set_chat_active(peer_id, True)
+            return "✅ Бот активирован в этой беседе!"
+        return no_access()
+
+    # ══════════════════════════════════════
+    #   /тишина
+    # ══════════════════════════════════════
+    if cmd in ("/тишина", "!тишина", "/silence", "!silence"):
+        if from_priority < HIERARCHY.get("Руководитель сообщества", 90) and not is_owner:
+            return no_access()
+        current = storage.is_silence(peer_id)
+        storage.set_silence(peer_id, not current)
+        if not current:
+            return "🔇 Тишина включена. Сообщения не-модераторов будут удаляться."
+        return "🔊 Тишина выключена."
+
+    # ══════════════════════════════════════
+    #   /чистка / /clear
+    # ══════════════════════════════════════
+    if cmd in ("/чистка", "!чистка", "/clear", "!clear"):
+        if not is_moder and not is_owner:
+            return no_access()
+        count = int(args) if args.isdigit() else 10
+        count = min(count, 50)  # максимум 50
+        try:
+            history = vk.messages.getHistory(peer_id=peer_id, count=count)
+            items = history.get("items", [])
+            if not items:
+                return "❌ Нет сообщений для удаления."
+            cmids = [m.get("conversation_message_id") for m in items if m.get("conversation_message_id")]
+            if cmids:
+                vk.messages.delete(
+                    conversation_message_ids=",".join(map(str, cmids)),
+                    peer_id=peer_id,
+                    delete_for_all=1
+                )
+            return f"✅ Удалено {len(cmids)} сообщений."
+        except Exception as e:
+            return f"❌ Ошибка: {e}"
+
+    # ══════════════════════════════════════
+    #   /demote — расформировать чат
+    # ══════════════════════════════════════
+    if cmd in ("/demote", "!demote", "/расформировать", "!расформировать"):
+        if not is_owner:
+            return no_access()
+        try:
+            members = vk.messages.getConversationMembers(peer_id=peer_id)
+            profiles = members.get("profiles", [])
+            kicked = 0
+            for p in profiles:
+                uid = p.get("id")
+                if uid and uid != from_user_id:
+                    try:
+                        vk.messages.removeChatUser(
+                            chat_id=peer_id - 2000000000,
+                            user_id=uid
+                        )
+                        kicked += 1
+                    except Exception:
+                        pass
+            storage.set_chat_active(peer_id, False)
+            storage.set_silence(peer_id, False)
+            return f"💀 Беседа расформирована. Кикнуто: {kicked} участников."
+        except Exception as e:
+            return f"❌ Ошибка: {e}"
+
+    # ══════════════════════════════════════
+    #   /зов — упомянуть всех
+    # ══════════════════════════════════════
+    if cmd in ("/зов", "!зов", "/all", "!all"):
+        if from_priority < HIERARCHY.get("Заместитель руководителя модерации", 70) and not is_owner:
+            return no_access()
+        try:
+            members = vk.messages.getConversationMembers(peer_id=peer_id)
+            profiles = members.get("profiles", [])
+            mentions = []
+            for p in profiles:
+                uid = p.get("id")
+                if uid and uid != from_user_id:
+                    name = f"{p.get('first_name', '')} {p.get('last_name', '')}".strip()
+                    mentions.append(make_mention(uid, name))
+            reason = args.strip() or ""
+            header = f"📢 {reason}\n\n" if reason else "📢 Всех вызывают!\n\n"
+            return header + " ".join(mentions)
+        except Exception as e:
+            return f"❌ Ошибка: {e}"
+
+    # ══════════════════════════════════════
+    #   /рассылка
+    # ══════════════════════════════════════
+    if cmd in ("/рассылка", "!рассылка", "/broadcast", "!broadcast"):
+        if not is_owner:
+            return no_access()
+        if not args.strip():
+            return "❌ Формат: /рассылка [текст]"
+        all_peers = storage.get_all_chat_peer_ids()
+        sent = 0
+        for pid in all_peers:
+            if pid > 2000000000:
+                try:
+                    vk.messages.send(peer_id=pid, message=args.strip(),
+                                     random_id=int(datetime.now().timestamp() * 1000) + pid)
+                    sent += 1
+                except Exception as e:
+                    print(f"[WARN] broadcast {pid}: {e}")
+        return f"✅ Рассылка отправлена в {sent} беседах."
+
+    # ══════════════════════════════════════
+    #   /demote цели — снять должность
+    # ══════════════════════════════════════
+    if cmd in ("/уволить", "!уволить"):
+        target_id, _ = resolve_target(args, reply_user_id)
+        if not target_id:
+            return "❌ Укажи пользователя."
+        target_mod = storage.get_moderator(target_id)
+        if not target_mod:
+            return "❌ Пользователь не в системе."
+        target_priority = HIERARCHY.get(target_mod.get("position", ""), 0)
+        if target_priority >= from_priority and not is_owner:
+            return "⛔ Нельзя уволить человека с равной или высшей должностью."
+        if storage.remove_moderator(target_id):
+            return f"✅ {make_mention(target_id, target_mod['nick'])} уволен."
+        return "❌ Ошибка."
+
+    # ══════════════════════════════════════
     #   ЭКОНОМИКА
     # ══════════════════════════════════════
 
-    # /баланс
     if cmd in ("/баланс", "!баланс", "/balance", "!balance"):
         target_id, _ = resolve_target(args, reply_user_id)
         if not target_id:
             target_id = from_user_id
-
         eco = storage.get_eco(target_id)
         mod = storage.get_moderator(target_id)
         name = mod["nick"] if mod else get_user_name(target_id)
-
-        # Скрытый баланс
         if target_id != from_user_id and eco.get("hide_balance") and eco.get("hide_balance_active"):
             return f"💰 {make_mention(target_id, name)}: баланс скрыт 🙈"
-
         vip_str = " 👑 VIP" if eco.get("vip") else ""
         dep = eco.get("deposit")
-        dep_str = f"\n🏦 Депозит: {fmt(dep['amount'])} {CURRENCY} (до {dep['until'][:10]})" if dep else ""
-
         lines = [f"💰 Баланс {make_mention(target_id, name)}{vip_str}"]
         lines.append(f"На руках: {fmt(eco['balance'])} {CURRENCY}")
         lines.append(f"В банке: {fmt(eco['bank'])} {CURRENCY}")
         lines.append(f"Всего: {fmt(eco['balance'] + eco['bank'])} {CURRENCY}")
-        if dep_str:
-            lines.append(dep_str)
+        if dep:
+            lines.append(f"🏦 Депозит: {fmt(dep['amount'])} {CURRENCY} (до {dep['until'][:10]})")
         return "\n".join(lines)
 
-    # /приз
     if cmd in ("/приз", "!приз", "/prize", "!prize"):
         last = storage.get_prize_last(from_user_id)
         if last:
             last_dt = datetime.strptime(last, "%Y-%m-%d %H:%M:%S")
             diff = (datetime.now() - last_dt).total_seconds()
             if diff < PRIZE_COOLDOWN:
-                remaining = PRIZE_COOLDOWN - int(diff)
-                return f"⏳ Следующий приз через {format_time(remaining)}"
+                return f"⏳ Следующий приз через {format_time(PRIZE_COOLDOWN - int(diff))}"
         storage.claim_prize(from_user_id, PRIZE_AMOUNT)
         mod = storage.get_moderator(from_user_id)
         name = mod["nick"] if mod else get_user_name(from_user_id)
-        return (f"🎁 {make_mention(from_user_id, name)} получил ежечасный приз!\n"
+        return (f"🎁 {make_mention(from_user_id, name)} получил приз!\n"
                 f"+{fmt(PRIZE_AMOUNT)} {CURRENCY}\n"
                 f"Баланс: {fmt(storage.get_balance(from_user_id))} {CURRENCY}")
 
-    # /передать
     if cmd in ("/передать", "!передать", "/transfer", "!transfer"):
         target_id, rest = resolve_target(args, reply_user_id)
-        if not target_id:
-            return "❌ Укажи пользователя."
-        if not rest.strip().isdigit():
+        if not target_id or not rest.strip().isdigit():
             return "❌ Формат: /передать [цель] [сумма]"
         amount = int(rest.strip())
-        if amount <= 0:
-            return "❌ Сумма должна быть больше 0."
-        if target_id == from_user_id:
-            return "❌ Нельзя передать себе."
+        if amount <= 0 or target_id == from_user_id:
+            return "❌ Некорректная операция."
         if not storage.transfer(from_user_id, target_id, amount):
-            return f"❌ Недостаточно {CURRENCY}. Баланс: {fmt(storage.get_balance(from_user_id))}"
+            return f"❌ Недостаточно {CURRENCY}."
         mod = storage.get_moderator(target_id)
         name = mod["nick"] if mod else get_user_name(target_id)
         return f"✅ Передано {fmt(amount)} {CURRENCY} → {make_mention(target_id, name)}"
 
-    # /положить
     if cmd in ("/положить", "!положить"):
         if not args.isdigit():
             return "❌ Формат: /положить [сумма]"
-        amount = int(args)
-        if not storage.deposit_to_bank(from_user_id, amount):
-            return f"❌ Недостаточно средств."
-        return (f"✅ Положено в банк: {fmt(amount)} {CURRENCY}\n"
-                f"Баланс: {fmt(storage.get_balance(from_user_id))} {CURRENCY}\n"
+        if not storage.deposit_to_bank(from_user_id, int(args)):
+            return "❌ Недостаточно средств."
+        return (f"✅ Положено: {fmt(args)} {CURRENCY}\n"
                 f"В банке: {fmt(storage.get_bank(from_user_id))} {CURRENCY}")
 
-    # /снять
     if cmd in ("/снять", "!снять"):
         if not args.isdigit():
             return "❌ Формат: /снять [сумма]"
-        amount = int(args)
-        if not storage.withdraw_from_bank(from_user_id, amount):
-            return f"❌ Недостаточно в банке."
-        return (f"✅ Снято из банка: {fmt(amount)} {CURRENCY}\n"
+        if not storage.withdraw_from_bank(from_user_id, int(args)):
+            return "❌ Недостаточно в банке."
+        return (f"✅ Снято: {fmt(args)} {CURRENCY}\n"
                 f"Баланс: {fmt(storage.get_balance(from_user_id))} {CURRENCY}")
 
-    # /топ
     if cmd in ("/топ", "!топ", "/top", "!top"):
         top = storage.get_rich_top()
         if not top:
             return "Список пуст."
-        lines = [f"💰 Топ богачей:\n"]
+        lines = ["💰 Топ богачей:\n"]
         for i, entry in enumerate(top[:15], 1):
             uid = entry["user_id"]
             eco = storage.get_eco(uid)
@@ -262,45 +380,37 @@ def handle_command(text, from_user_id, peer_id, storage, vk, get_user_name,
             lines.append(f"{i}. {make_mention(uid, name)}{vip} — {fmt(entry['total'])} {CURRENCY}")
         return "\n".join(lines)
 
-    # /buyvip
-    if cmd in ("/buyvip", "!buyvip", "/випка", "!випка"):
+    if cmd in ("/buyvip", "!buyvip"):
         if storage.is_vip(from_user_id):
             return "✅ У тебя уже есть VIP 👑"
         if not storage.buy_vip(from_user_id, VIP_PRICE):
-            return f"❌ Нужно {fmt(VIP_PRICE)} {CURRENCY}. У тебя: {fmt(storage.get_balance(from_user_id))}"
-        return f"✅ VIP 👑 куплен!\nПотрачено: {fmt(VIP_PRICE)} {CURRENCY}"
+            return f"❌ Нужно {fmt(VIP_PRICE)} {CURRENCY}."
+        return f"✅ VIP 👑 куплен! Потрачено: {fmt(VIP_PRICE)} {CURRENCY}"
 
-    # /buyhidebalance
     if cmd in ("/buyhidebalance", "!buyhidebalance"):
         if storage.has_hide_balance(from_user_id):
             return "✅ У тебя уже есть скрытый баланс."
         if not storage.buy_hide_balance(from_user_id, HIDE_BALANCE_PRICE):
             return f"❌ Нужно {fmt(HIDE_BALANCE_PRICE)} {CURRENCY}."
-        return f"✅ Скрытый баланс куплен! Используй /hidebalance для включения/выключения."
+        return "✅ Скрытый баланс куплен! Используй /hidebalance."
 
-    # /hidebalance
     if cmd in ("/hidebalance", "!hidebalance"):
         if not storage.has_hide_balance(from_user_id):
             return f"❌ Сначала купи через /buyhidebalance за {fmt(HIDE_BALANCE_PRICE)} {CURRENCY}"
         state = storage.toggle_hide_balance(from_user_id)
         return f"✅ Скрытый баланс: {'включён 🙈' if state else 'выключен 👁'}"
 
-    # /благо
     if cmd in ("/благо", "!благо"):
-        if not args.isdigit():
+        if not args.isdigit() or int(args) <= 0:
             return "❌ Формат: /благо [сумма]"
-        amount = int(args)
-        if amount <= 0:
-            return "❌ Сумма должна быть больше 0."
-        if not storage.donate_charity(from_user_id, amount):
-            return f"❌ Недостаточно средств."
+        if not storage.donate_charity(from_user_id, int(args)):
+            return "❌ Недостаточно средств."
+        total = storage.get_eco(from_user_id)["charity_total"]
         mod = storage.get_moderator(from_user_id)
         name = mod["nick"] if mod else get_user_name(from_user_id)
-        total = storage.get_eco(from_user_id)["charity_total"]
-        return (f"❤️ {make_mention(from_user_id, name)} пожертвовал {fmt(amount)} {CURRENCY}!\n"
+        return (f"❤️ {make_mention(from_user_id, name)} пожертвовал {fmt(args)} {CURRENCY}!\n"
                 f"Всего пожертвовано: {fmt(total)} {CURRENCY}")
 
-    # /топблаго
     if cmd in ("/топблаго", "!топблаго"):
         top = storage.get_charity_top()
         if not top:
@@ -313,203 +423,161 @@ def handle_command(text, from_user_id, peer_id, storage, vk, get_user_name,
             lines.append(f"{i}. {make_mention(uid, name)} — {fmt(entry['amount'])} {CURRENCY}")
         return "\n".join(lines)
 
-    # /открытьдепозит
     if cmd in ("/открытьдепозит", "!открытьдепозит"):
         if not is_vip:
-            return f"❌ Депозит только для VIP 👑 (/buyvip за {fmt(VIP_PRICE)} {CURRENCY})"
+            return f"❌ Депозит только для VIP 👑"
         if storage.get_deposit(from_user_id):
             return "❌ У тебя уже открыт депозит."
         if not args.isdigit():
             return "❌ Формат: /открытьдепозит [сумма]"
-        amount = int(args)
-        if not storage.open_deposit(from_user_id, amount, DEPOSIT_RATE, DEPOSIT_DAYS):
-            return f"❌ Недостаточно средств или депозит уже открыт."
-        earned = int(amount * DEPOSIT_RATE)
+        if not storage.open_deposit(from_user_id, int(args), DEPOSIT_RATE, DEPOSIT_DAYS):
+            return "❌ Недостаточно средств."
+        earned = int(int(args) * DEPOSIT_RATE)
         until = (datetime.now() + timedelta(days=DEPOSIT_DAYS)).strftime("%d.%m.%Y")
-        return (f"🏦 Депозит открыт!\nСумма: {fmt(amount)} {CURRENCY}\n"
-                f"Доход: +{fmt(earned)} {CURRENCY} ({int(DEPOSIT_RATE*100)}%)\n"
-                f"Закрыть: {until}")
+        return (f"🏦 Депозит открыт!\nСумма: {fmt(args)} {CURRENCY}\n"
+                f"Доход: +{fmt(earned)} {CURRENCY} (3%)\nЗакрыть: {until}")
 
-    # /закрытьдепозит
     if cmd in ("/закрытьдепозит", "!закрытьдепозит"):
         result = storage.close_deposit(from_user_id)
         if not result:
-            return "❌ У тебя нет открытого депозита."
+            return "❌ Нет открытого депозита."
         if result["early"]:
             return (f"⚠️ Депозит закрыт досрочно!\n"
-                    f"Возвращено: {fmt(result['amount'])} {CURRENCY}\n"
-                    f"Проценты не начислены.")
-        return (f"✅ Депозит закрыт!\n"
-                f"Сумма: {fmt(result['amount'])} {CURRENCY}\n"
+                    f"Возвращено: {fmt(result['amount'])} {CURRENCY}\nПроценты не начислены.")
+        return (f"✅ Депозит закрыт!\nСумма: {fmt(result['amount'])} {CURRENCY}\n"
                 f"Проценты: +{fmt(result['earned'])} {CURRENCY}\n"
                 f"Итого: {fmt(result['amount'] + result['earned'])} {CURRENCY}")
 
-    # /рулетка
     if cmd in ("/рулетка", "!рулетка"):
         if not args.isdigit():
-            return f"❌ Формат: /рулетка [ставка]\nМин. ставка: {fmt(ROULETTE_MIN)} {CURRENCY}"
-        bet = int(args)
-        result = storage.roulette(from_user_id, bet)
+            return f"❌ Формат: /рулетка [ставка]\nМин.: {fmt(ROULETTE_MIN)} {CURRENCY}"
+        result = storage.roulette(from_user_id, int(args))
         if not result["ok"]:
-            return (f"❌ Недостаточно средств или ставка меньше минимума ({fmt(ROULETTE_MIN)} {CURRENCY}).\n"
-                    f"Баланс: {fmt(storage.get_balance(from_user_id))} {CURRENCY}")
+            return f"❌ Недостаточно средств или ставка меньше {fmt(ROULETTE_MIN)} {CURRENCY}"
         mod = storage.get_moderator(from_user_id)
         name = mod["nick"] if mod else get_user_name(from_user_id)
+        bal = storage.get_balance(from_user_id)
         if result["result"] == "джекпот":
             return (f"🎰 ДЖЕКПОТ! {make_mention(from_user_id, name)}\n"
-                    f"Ставка: {fmt(bet)} {CURRENCY}\n"
-                    f"Выигрыш: +{fmt(result['win'])} {CURRENCY} (x5) 🎉\n"
-                    f"Баланс: {fmt(storage.get_balance(from_user_id))} {CURRENCY}")
+                    f"Ставка: {fmt(result['bet'])} | Выигрыш: +{fmt(result['win'])} (x5) 🎉\n"
+                    f"Баланс: {fmt(bal)} {CURRENCY}")
         elif result["result"] == "победа":
             return (f"🎰 Победа! {make_mention(from_user_id, name)}\n"
-                    f"Ставка: {fmt(bet)} {CURRENCY}\n"
-                    f"Выигрыш: +{fmt(result['win'])} {CURRENCY} (x2)\n"
-                    f"Баланс: {fmt(storage.get_balance(from_user_id))} {CURRENCY}")
+                    f"Ставка: {fmt(result['bet'])} | Выигрыш: +{fmt(result['win'])} (x2)\n"
+                    f"Баланс: {fmt(bal)} {CURRENCY}")
         else:
             return (f"🎰 Не повезло... {make_mention(from_user_id, name)}\n"
-                    f"Ставка: {fmt(bet)} {CURRENCY}\n"
-                    f"Потеряно: -{fmt(bet)} {CURRENCY}\n"
-                    f"Баланс: {fmt(storage.get_balance(from_user_id))} {CURRENCY}")
+                    f"Ставка: {fmt(result['bet'])} | Потеряно: -{fmt(result['bet'])}\n"
+                    f"Баланс: {fmt(bal)} {CURRENCY}")
 
-    # /promo
     if cmd in ("/promo", "!promo", "/промо", "!промо"):
         if not args.strip():
             return "❌ Формат: /promo [код]"
-        code = args.strip().lower()
-        result = storage.activate_promo(from_user_id, code)
+        result = storage.activate_promo(from_user_id, args.strip().lower())
         if not result["ok"]:
-            reasons = {
-                "not_found": "Промокод не найден.",
-                "already_used": "Ты уже активировал этот промокод.",
-                "expired": "Промокод больше не активен."
-            }
+            reasons = {"not_found": "Промокод не найден.",
+                       "already_used": "Уже активирован.", "expired": "Промокод истёк."}
             return f"❌ {reasons.get(result['reason'], 'Ошибка.')}"
         return (f"✅ Промокод активирован!\n"
                 f"+{fmt(result['amount'])} {CURRENCY}\n"
                 f"Баланс: {fmt(storage.get_balance(from_user_id))} {CURRENCY}")
 
-    # /addpromo (только VIP)
     if cmd in ("/addpromo", "!addpromo"):
         if not is_vip and not is_owner:
-            return f"❌ Только для VIP 👑"
+            return "❌ Только для VIP 👑"
         m = re.match(r"(\S+)\s+(\d+)(?:\s+(\d+))?", args)
         if not m:
-            return "❌ Формат: /addpromo [код] [сумма] [активации]\nПример: /addpromo хз 10 5"
-        code = m.group(1).lower()
-        amount = int(m.group(2))
-        uses = int(m.group(3)) if m.group(3) else PROMO_MAX_USES
-
+            return "❌ Формат: /addpromo [код] [сумма] [активации]"
+        code, amount, uses = m.group(1).lower(), int(m.group(2)), int(m.group(3) or PROMO_MAX_USES)
         if not is_owner:
             if amount > PROMO_MAX_AMOUNT:
-                return f"❌ Максимальная сумма для VIP: {PROMO_MAX_AMOUNT} {CURRENCY}"
+                return f"❌ Макс. сумма VIP: {PROMO_MAX_AMOUNT} {CURRENCY}"
             if uses > PROMO_MAX_USES:
-                return f"❌ Максимум активаций для VIP: {PROMO_MAX_USES}"
+                return f"❌ Макс. активаций VIP: {PROMO_MAX_USES}"
             if storage.get_balance(from_user_id) < amount * uses:
-                return f"❌ Нужно {fmt(amount * uses)} {CURRENCY} для создания промокода."
+                return f"❌ Нужно {fmt(amount * uses)} {CURRENCY}"
             storage.add_balance(from_user_id, -(amount * uses))
-
         if not storage.create_promo(code, amount, uses, from_user_id):
             return "❌ Промокод уже существует."
-        return (f"✅ Промокод создан: {code}\n"
-                f"Сумма: {fmt(amount)} {CURRENCY}\n"
-                f"Активаций: {uses}")
+        return f"✅ Промокод {code} создан!\nСумма: {fmt(amount)} | Активаций: {uses}"
 
-    # /mypromo
     if cmd in ("/mypromo", "!mypromo"):
         promos = storage.get_user_promos(from_user_id)
         if not promos:
             return "У тебя нет активированных промокодов."
-        lines = ["🎫 Мои промокоды:\n"]
+        lines = ["🎫 Мои промокоды:"]
         for p in promos:
             lines.append(f"• {p['code']} — +{fmt(p['amount'])} {CURRENCY}")
         return "\n".join(lines)
 
-    # /promolist
     if cmd in ("/promolist", "!promolist"):
         if not is_owner:
             return no_access()
         promos = storage.data.get("promos", {})
         if not promos:
             return "Промокодов нет."
-        lines = ["📋 Все промокоды:\n"]
+        lines = ["📋 Все промокоды:"]
         for code, p in promos.items():
-            lines.append(f"• {code}: {fmt(p['amount'])} {CURRENCY} | {p['uses']}/{p['max_uses']} активаций")
+            lines.append(f"• {code}: {fmt(p['amount'])} {CURRENCY} | {p['uses']}/{p['max_uses']}")
         return "\n".join(lines)
 
-    # /купитьбиз
     if cmd in ("/купитьбиз", "!купитьбиз"):
         biz_list = "\n".join(
-            f"• {name}: {fmt(info['price'])} {CURRENCY} | доход {fmt(info['income'])} {CURRENCY}/сут"
-            for name, info in BUSINESS.items()
-        )
+            f"• {n}: {fmt(i['price'])} {CURRENCY} | {fmt(i['income'])} {CURRENCY}/сут"
+            for n, i in BUSINESS.items())
         if not args.strip():
-            return f"🏭 Доступные бизнесы:\n{biz_list}\n\nФормат: /купитьбиз [название]"
+            return f"🏭 Бизнесы:\n{biz_list}\n\nФормат: /купитьбиз [название]"
         biz_type = args.strip().lower()
         if biz_type not in BUSINESS:
-            return f"❌ Бизнес не найден.\n{biz_list}"
+            return f"❌ Не найден.\n{biz_list}"
         biz_info = BUSINESS[biz_type]
         if not storage.buy_business(from_user_id, biz_type, biz_info["price"]):
-            return f"❌ Недостаточно средств. Нужно: {fmt(biz_info['price'])} {CURRENCY}"
-        return (f"✅ Куплен {biz_type}!\n"
-                f"Доход: {fmt(biz_info['income'])} {CURRENCY}/сут\n"
-                f"Нужны продукты: /ппрод [индекс] [кол-во]")
+            return f"❌ Нужно {fmt(biz_info['price'])} {CURRENCY}"
+        return f"✅ Куплен {biz_type}!\nДоход: {fmt(biz_info['income'])} {CURRENCY}/сут"
 
-    # /бизнес
     if cmd in ("/бизнес", "!бизнес"):
         bizs = storage.get_businesses(from_user_id)
         if not bizs:
-            return "У тебя нет бизнесов. Купи: /купитьбиз"
-        lines = ["🏭 Мои бизнесы:\n"]
+            return "Нет бизнесов. Купи: /купитьбиз"
+        lines = ["🏭 Мои бизнесы:"]
         for i, biz in enumerate(bizs):
             info = BUSINESS.get(biz["type"], {})
             prod_days = biz["products"] / info.get("products_per_day", 100) if biz["products"] > 0 else 0
-            lines.append(
-                f"{i+1}. {biz['type'].capitalize()}\n"
-                f"   Продукты: {biz['products']} (хватит на {prod_days:.1f} дн.)\n"
-                f"   Доход: {fmt(info.get('income', 0))} {CURRENCY}/сут\n"
-                f"   Накоплено: {fmt(biz.get('balance', 0))} {CURRENCY}"
-            )
+            lines.append(f"{i+1}. {biz['type'].capitalize()}\n"
+                         f"   Продукты: {biz['products']} (~{prod_days:.1f} дн.)\n"
+                         f"   Накоплено: {fmt(biz.get('balance', 0))} {CURRENCY}")
         return "\n".join(lines)
 
-    # /ппрод
     if cmd in ("/ппрод", "!ппрод"):
         m = re.match(r"(\d+)\s+(\d+)", args)
         if not m:
-            return "❌ Формат: /ппрод [индекс бизнеса] [кол-во продуктов]\nПример: /ппрод 1 100"
+            return "❌ Формат: /ппрод [индекс] [кол-во]"
         biz_index = int(m.group(1)) - 1
         products = int(m.group(2))
-        biz_type_info = None
         bizs = storage.get_businesses(from_user_id)
-        if biz_index < len(bizs):
-            biz_type_info = BUSINESS.get(bizs[biz_index]["type"])
-        if not biz_type_info:
+        if biz_index >= len(bizs):
             return "❌ Бизнес не найден."
-        cost = products * biz_type_info["product_price"]
+        biz_info = BUSINESS.get(bizs[biz_index]["type"])
+        cost = products * biz_info["product_price"]
         if not storage.add_products(from_user_id, biz_index, products, cost):
-            return f"❌ Недостаточно средств. Нужно: {fmt(cost)} {CURRENCY}"
-        return (f"✅ Куплено {products} продуктов за {fmt(cost)} {CURRENCY}\n"
-                f"Хватит на {products / biz_type_info['products_per_day']:.1f} дн.")
+            return f"❌ Нужно {fmt(cost)} {CURRENCY}"
+        return f"✅ Куплено {products} продуктов за {fmt(cost)} {CURRENCY}"
 
-    # /снятьбиз
     if cmd in ("/снятьбиз", "!снятьбиз"):
         income = storage.collect_business(from_user_id)
         if income == 0:
-            return "💰 Нечего снимать — продукты закончились или нет бизнесов."
-        return (f"✅ Снято с бизнесов: {fmt(income)} {CURRENCY}\n"
+            return "💰 Нечего снимать."
+        return (f"✅ Снято: {fmt(income)} {CURRENCY}\n"
                 f"Баланс: {fmt(storage.get_balance(from_user_id))} {CURRENCY}")
 
-    # /топбиз
     if cmd in ("/топбиз", "!топбиз"):
-        all_eco = storage.data.get("economy", {})
-        result = []
-        for uid, eco in all_eco.items():
-            biz_count = len(eco.get("businesses", []))
-            if biz_count > 0:
-                result.append({"user_id": int(uid), "count": biz_count})
+        result = [{"user_id": int(uid), "count": len(eco.get("businesses", []))}
+                  for uid, eco in storage.data.get("economy", {}).items()
+                  if eco.get("businesses")]
         result.sort(key=lambda x: x["count"], reverse=True)
         if not result:
-            return "Никто ещё не купил бизнес."
-        lines = ["🏭 Топ бизнесменов:\n"]
+            return "Никто не купил бизнес."
+        lines = ["🏭 Топ бизнесменов:"]
         for i, entry in enumerate(result[:10], 1):
             uid = entry["user_id"]
             mod = storage.get_moderator(uid)
@@ -517,80 +585,60 @@ def handle_command(text, from_user_id, peer_id, storage, vk, get_user_name,
             lines.append(f"{i}. {make_mention(uid, name)} — {entry['count']} бизнесов")
         return "\n".join(lines)
 
-    # /sellbiz
     if cmd in ("/sellbiz", "!sellbiz"):
         bizs = storage.get_businesses(from_user_id)
         if not bizs:
-            return "❌ У тебя нет бизнесов."
+            return "❌ Нет бизнесов."
         total = storage.sell_businesses(from_user_id)
-        return (f"✅ Все бизнесы проданы государству за {fmt(total)} {CURRENCY} (50% стоимости)\n"
+        return (f"✅ Продано государству за {fmt(total)} {CURRENCY} (50%)\n"
                 f"Баланс: {fmt(storage.get_balance(from_user_id))} {CURRENCY}")
 
-    # /sellmybiz
     if cmd in ("/sellmybiz", "!sellmybiz"):
         m = re.match(r"(\d+)\s+(.+)\s+(\d+)", args)
         if not m:
             return "❌ Формат: /sellmybiz [индекс] [@покупатель] [цена]"
         biz_index = int(m.group(1)) - 1
-        target_args = m.group(2).strip()
+        target_id, _ = parse_target(m.group(2).strip())
         price = int(m.group(3))
-        target_id, _ = parse_target(target_args)
         if not target_id:
             return "❌ Укажи покупателя."
         if not storage.sell_business_to_user(from_user_id, target_id, biz_index, price):
-            return "❌ Ошибка. Проверь индекс бизнеса и баланс покупателя."
+            return "❌ Ошибка продажи."
         mod = storage.get_moderator(target_id)
         name = mod["nick"] if mod else get_user_name(target_id)
         return f"✅ Бизнес продан {make_mention(target_id, name)} за {fmt(price)} {CURRENCY}"
 
-    # /дуэль
     if cmd in ("/дуэль", "!дуэль", "/duel", "!duel"):
-        if not args.isdigit():
+        if not args.isdigit() or int(args) <= 0:
             return "❌ Формат: /дуэль [сумма]"
         amount = int(args)
-        if amount <= 0:
-            return "❌ Сумма должна быть больше 0."
         if storage.get_balance(from_user_id) < amount:
-            return f"❌ Недостаточно средств. Баланс: {fmt(storage.get_balance(from_user_id))} {CURRENCY}"
-
+            return f"❌ Недостаточно средств."
         duel_id = f"{from_user_id}_{int(datetime.now().timestamp())}"
         storage.create_duel(duel_id, from_user_id, amount, peer_id)
         storage.add_balance(from_user_id, -amount)
-
         mod = storage.get_moderator(from_user_id)
         name = mod["nick"] if mod else get_user_name(from_user_id)
-
         send_keyboard(vk, peer_id,
             f"⚔️ {make_mention(from_user_id, name)} создал дуэль на {fmt(amount)} {CURRENCY}!\n"
             f"Нажми кнопку чтобы вступить.",
-            [[{
-                "action": {
-                    "type": "callback",
-                    "label": f"⚔️ Вступить в дуэль",
-                    "payload": f'{{"cmd":"duel_join","duel_id":"{duel_id}"}}'
-                },
-                "color": "positive"
-            }]]
-        )
+            [[{"action": {"type": "callback", "label": "⚔️ Вступить в дуэль",
+                          "payload": f'{{"cmd":"duel_join","duel_id":"{duel_id}"}}'}, "color": "positive"}]])
         return None
 
-    # /пнуть
-    if cmd in ("/пнуть", "!пнуть", "/kick_fun", "!kick_fun"):
+    if cmd in ("/пнуть", "!пнуть"):
         target_id, _ = resolve_target(args, reply_user_id)
-        if not target_id:
-            return "❌ Укажи пользователя."
-        if target_id == from_user_id:
-            return "❌ Нельзя пнуть себя!"
+        if not target_id or target_id == from_user_id:
+            return "❌ Укажи цель."
         storage.add_kick(target_id)
         kicks = storage.get_kicks(target_id)
-        mod_from = storage.get_moderator(from_user_id)
-        name_from = mod_from["nick"] if mod_from else get_user_name(from_user_id)
-        mod_target = storage.get_moderator(target_id)
-        name_target = mod_target["nick"] if mod_target else get_user_name(target_id)
-        return (f"👟 {make_mention(from_user_id, name_from)} пнул {make_mention(target_id, name_target)}!\n"
+        mod_f = storage.get_moderator(from_user_id)
+        nf = mod_f["nick"] if mod_f else get_user_name(from_user_id)
+        mod_t = storage.get_moderator(target_id)
+        nt = mod_t["nick"] if mod_t else get_user_name(target_id)
+        return (f"👟 {make_mention(from_user_id, nf)} пнул {make_mention(target_id, nt)}!\n"
                 f"Всего пинков: {kicks}")
 
-    # /give (только owner)
     if cmd in ("/give", "!give"):
         if not is_owner:
             return no_access()
@@ -603,16 +651,15 @@ def handle_command(text, from_user_id, peer_id, storage, vk, get_user_name,
         name = mod["nick"] if mod else get_user_name(target_id)
         return f"✅ {make_mention(target_id, name)} выдано {fmt(amount)} {CURRENCY}"
 
-    # /givebiz (только owner)
     if cmd in ("/givebiz", "!givebiz"):
         if not is_owner:
             return no_access()
         target_id, rest = resolve_target(args, reply_user_id)
         if not target_id:
-            return "❌ Формат: /givebiz [цель] [тип бизнеса]"
+            return "❌ Формат: /givebiz [цель] [тип]"
         biz_type = rest.strip().lower()
         if biz_type not in BUSINESS:
-            return f"❌ Бизнес не найден. Доступные: {', '.join(BUSINESS.keys())}"
+            return f"❌ Не найден. Доступные: {', '.join(BUSINESS.keys())}"
         eco = storage.get_eco(target_id)
         eco["businesses"].append({
             "type": biz_type, "bought": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -623,42 +670,20 @@ def handle_command(text, from_user_id, peer_id, storage, vk, get_user_name,
         name = mod["nick"] if mod else get_user_name(target_id)
         return f"✅ {make_mention(target_id, name)} выдан бизнес: {biz_type}"
 
-    # /gamehelp
     if cmd in ("/gamehelp", "!gamehelp"):
         return (
             "🎮 Игровые команды:\n\n"
-            "💰 Баланс и банк:\n"
-            "/баланс [цель] — посмотреть баланс\n"
-            "/положить [сумма] — в банк\n"
-            "/снять [сумма] — из банка\n"
-            "/передать [цель] [сумма] — перевести\n\n"
-            "🎁 Ежечасно:\n"
-            "/приз — получить 25 монет (раз в час)\n\n"
-            "💎 VIP (1000 монет):\n"
-            "/buyvip — купить VIP\n"
-            "/открытьдепозит [сумма] — депозит 3% на 10 дн.\n"
-            "/закрытьдепозит — закрыть депозит\n"
-            "/addpromo [код] [сумма] [активации] — создать промо\n\n"
-            "🏭 Бизнес:\n"
-            "/купитьбиз [тип] — купить бизнес\n"
-            "/бизнес — статистика\n"
-            "/ппрод [индекс] [кол-во] — пополнить продукты\n"
-            "/снятьбиз — снять доход\n"
-            "/топбиз — топ бизнесменов\n"
-            "/sellbiz — продать государству (50%)\n"
-            "/sellmybiz [индекс] [цель] [цена] — продать игроку\n\n"
-            "🎲 Игры:\n"
-            "/рулетка [ставка] — мин. 50 монет\n"
-            "/дуэль [сумма] — дуэль с кнопкой\n\n"
-            "📊 Прочее:\n"
-            "/топ — богачи\n"
-            "/топблаго — благотворители\n"
-            "/благо [сумма] — пожертвовать\n"
-            "/promo [код] — активировать промокод\n"
-            "/mypromo — мои промокоды\n"
-            "/buyhidebalance — скрытый баланс (1500)\n"
-            "/hidebalance — вкл/выкл скрытый баланс\n"
-            "/пнуть [цель] — пнуть пользователя\n"
+            "💰 /баланс | /передать | /положить | /снять\n"
+            "🎁 /приз — 25 монет каждый час\n"
+            "💎 /buyvip — VIP за 1000 монет\n"
+            "🏦 /открытьдепозит | /закрытьдепозит (VIP)\n"
+            "🏭 /купитьбиз | /бизнес | /ппрод | /снятьбиз\n"
+            "🎲 /рулетка | /дуэль\n"
+            "📊 /топ | /топблаго | /топбиз\n"
+            "❤️ /благо — благотворительность\n"
+            "🎫 /promo | /addpromo (VIP) | /mypromo\n"
+            "🙈 /buyhidebalance | /hidebalance\n"
+            "👟 /пнуть\n"
         )
 
     # ══════════════════════════════════════
@@ -671,9 +696,7 @@ def handle_command(text, from_user_id, peer_id, storage, vk, get_user_name,
             diff = datetime.now() - last_dt
             if diff.total_seconds() < 3600:
                 remaining = 3600 - int(diff.total_seconds())
-                mins = remaining // 60
-                secs = remaining % 60
-                return f"🍺 Ещё не время! Следующая попытка через {mins} мин. {secs} сек."
+                return f"🍺 Следующая попытка через {format_time(remaining)}"
         amount = round(random.uniform(0.1, 3.0), 1)
         storage.add_beer(from_user_id, amount)
         beer_data = storage.get_beer(from_user_id)
@@ -682,8 +705,7 @@ def handle_command(text, from_user_id, peer_id, storage, vk, get_user_name,
         mod = storage.get_moderator(from_user_id)
         name = mod["nick"] if mod else get_user_name(from_user_id)
         return (f"🍺 {make_mention(from_user_id, name)}, ты выпил {amount} литра пива!\n\n"
-                f"Выпито за месяц — {month_amount} л. 🍺\n"
-                f"Следующая попытка через час.")
+                f"Выпито за месяц — {month_amount} л. 🍺\nСледующая попытка через час.")
 
     if cmd in ("/пивозавры", "!пивозавры", "/beertop", "!beertop"):
         month = datetime.now().strftime("%Y-%m")
@@ -707,7 +729,7 @@ def handle_command(text, from_user_id, peer_id, storage, vk, get_user_name,
         return "✅ Статистика пива обнулена."
 
     # ══════════════════════════════════════
-    #   МУТ / РАЗМУТ
+    #   МУТ
     # ══════════════════════════════════════
     if cmd in ("/мут", "!мут", "/mute", "!mute"):
         if not is_moder and not is_owner:
@@ -717,7 +739,7 @@ def handle_command(text, from_user_id, peer_id, storage, vk, get_user_name,
             return "❌ Укажи пользователя."
         minutes, label, reason = parse_duration(rest)
         if not minutes:
-            return "❌ Формат: /мут [цель] [срок] [причина]"
+            return "❌ Формат: /мут [цель] [срок] [причина]\nПример: /мут @ник 30 мин оффтоп"
         reason = reason.strip() or "Без причины"
         until = (datetime.now() + timedelta(minutes=minutes)).strftime("%d/%m/%Y %H:%M:%S")
         mod = storage.get_moderator(from_user_id)
@@ -755,6 +777,10 @@ def handle_command(text, from_user_id, peer_id, storage, vk, get_user_name,
         existing = storage.get_moderator(target_id)
         if not existing:
             return "❌ Пользователь не в системе."
+        # Проверяем права — нельзя менять ник тому кто выше
+        target_priority = HIERARCHY.get(existing.get("position", ""), 0)
+        if target_priority >= from_priority and not is_owner:
+            return "⛔ Нельзя изменить ник пользователя с равной или высшей должностью."
         storage.set_moderator(target_id, nick, existing["role"], existing["position"])
         return f"✅ Ник изменён на: {nick}"
 
@@ -797,17 +823,19 @@ def handle_command(text, from_user_id, peer_id, storage, vk, get_user_name,
         "/мод": "Модератор",
         "/мм": "Младший модератор",
     }
+
     if cmd in position_commands:
         position = position_commands[cmd]
-        if not can_assign(from_user_id, position, storage, OWNER_ID):
-            return no_access()
         target_id, _ = resolve_target(args, reply_user_id)
         if not target_id:
             return "❌ Укажи пользователя."
+        # Фикс бага: проверяем и текущую должность цели и новую
+        if not can_assign(from_user_id, target_id, position, storage, OWNER_ID):
+            return "⛔ Нет прав для этого назначения."
         return set_user_position(target_id, position)
 
     # ══════════════════════════════════════
-    #   БАН / АНБАН / КИК
+    #   БАН / АНБАН / КИК / GBAN
     # ══════════════════════════════════════
     if cmd in ("/ban", "!ban"):
         if not is_moder and not is_owner:
@@ -830,7 +858,7 @@ def handle_command(text, from_user_id, peer_id, storage, vk, get_user_name,
         try:
             vk.messages.removeChatUser(chat_id=peer_id - 2000000000, user_id=target_id)
         except Exception as e:
-            print(f"[WARN] kick: {e}")
+            print(f"[WARN] ban kick: {e}")
         storage.add_ban(target_id, peer_id, reason, term, from_user_id, by_label)
         target_mod = storage.get_moderator(target_id)
         target_label = target_mod["nick"] if target_mod else get_user_name(target_id)
@@ -868,11 +896,9 @@ def handle_command(text, from_user_id, peer_id, storage, vk, get_user_name,
         if not is_owner:
             return no_access()
         target_id, rest = resolve_target(args, reply_user_id)
-        if not target_id:
-            return "❌ Укажи пользователя."
+        if not target_id or not rest.strip():
+            return "❌ Формат: /gban [цель] [причина]"
         reason = rest.strip()
-        if not reason:
-            return "❌ Укажи причину"
         by_name = get_user_name(from_user_id)
         all_peers = storage.get_all_chat_peer_ids()
         kicked = 0
@@ -927,10 +953,9 @@ def handle_command(text, from_user_id, peer_id, storage, vk, get_user_name,
             lines.append(f"Срок: {b['term']} | Выдал: {b['by_name']} | {b['date']}")
         else:
             lines.append("Блокировка в беседе: ✅ отсутствует")
-        lines.append("")
-        lines.append(f"Заблокирован в {banned_chats_count} беседах")
+        lines.append(f"\nЗаблокирован в {banned_chats_count} беседах")
         if recent_bans:
-            lines.append(f"\nПоследние блокировки ({len(recent_bans)}):\n")
+            lines.append(f"\nПоследние блокировки:\n")
             for i, b in enumerate(reversed(recent_bans), 1):
                 issuer_mod = storage.get_moderator(b["by"])
                 mod_info = f" | {issuer_mod['position']}" if issuer_mod else ""
@@ -944,16 +969,13 @@ def handle_command(text, from_user_id, peer_id, storage, vk, get_user_name,
         if not is_moder and not is_owner:
             return no_access()
         target_id, rest = resolve_target(args, reply_user_id)
-        if not target_id:
-            return "❌ Укажи пользователя."
-        reason = rest.strip()
-        if not reason:
-            return "❌ Укажи причину"
+        if not target_id or not rest.strip():
+            return "❌ Формат: /warn [цель] [причина]"
         issuer_name = get_user_name(from_user_id)
-        count = storage.add_warning(target_id, reason, from_user_id, issuer_name)
+        count = storage.add_warning(target_id, rest.strip(), from_user_id, issuer_name)
         mod = storage.get_moderator(target_id)
         name = mod["nick"] if mod else get_user_name(target_id)
-        return f"⚠️ Выговор {make_mention(target_id, name)}\nПричина: {reason}\nВыговоров: {count}"
+        return f"⚠️ Выговор {make_mention(target_id, name)}\nПричина: {rest.strip()}\nВыговоров: {count}"
 
     if cmd in ("/warns", "!warns"):
         if not is_moder and not is_owner:
@@ -985,7 +1007,7 @@ def handle_command(text, from_user_id, peer_id, storage, vk, get_user_name,
         return f"✅ Выговоры {make_mention(target_id, name)} сброшены"
 
     # ══════════════════════════════════════
-    #   MSTATS
+    #   MSTATS / STATS
     # ══════════════════════════════════════
     if cmd in ("/mstats", "!mstats", "/мстатс", "!мстатс"):
         if not is_moder and not is_owner:
@@ -1004,24 +1026,20 @@ def handle_command(text, from_user_id, peer_id, storage, vk, get_user_name,
         if net_chats:
             for pid in net_chats:
                 net_bans += storage.get_bans_in_chat(target_id, pid)
-        mute = storage.get_mute(target_id, peer_id)
         vk_name = get_user_name(target_id)
         lines = [f"📊 Статистика {make_mention(target_id, mod['nick'] if mod else vk_name)}\n"]
         lines.append(f"Роль: {mod['position'] if mod else '—'}")
-        lines.append(f"Общая блокировка в чатах JORDANS: {'🔴 есть' if gban else 'Нет'}")
-        lines.append(f"Общая блокировка в сетке беседы: {'🔴 есть' if net_bans else 'Нет'}")
+        lines.append(f"Общая блокировка JORDANS: {'🔴 есть' if gban else 'Нет'}")
+        lines.append(f"Общая блокировка в сетке: {'🔴 есть' if net_bans else 'Нет'}")
         lines.append(f"Активные наказания: {len(active_warns)}/{len(all_warns)}")
         lines.append(f"Последнее наказание выдал: {all_warns[-1]['issued_by_name'] if all_warns else '—'}")
         lines.append(f"Nick_Name: {mod['nick'] if mod else vk_name}")
         scope = f"сетка «{net_name}»" if net_name else "все беседы"
         lines.append(f"Всего сообщений в {scope}: {stats_net['total']}")
-        lines.append(f"Сообщений за сегодня в {scope}: {stats_net['today']}")
+        lines.append(f"Сообщений за сегодня: {stats_net['today']}")
         lines.append(f"Последнее сообщение: {stats_net['last_time'] or '—'}")
         return "\n".join(lines)
 
-    # ══════════════════════════════════════
-    #   STATS
-    # ══════════════════════════════════════
     if cmd in ("/stats", "!stats"):
         if not is_moder and not is_owner:
             return no_access()
@@ -1059,7 +1077,11 @@ def handle_command(text, from_user_id, peer_id, storage, vk, get_user_name,
         for pos in GSTAFF_POSITIONS:
             people = staff_by_pos[pos]
             lines.append(f"{pos}:")
-            lines.append(f"  {make_mention(people[0]['id'], people[0]['nick'])}" if people else "  Отсутствуют")
+            if people:
+                for p in people:
+                    lines.append(f"  {make_mention(p['id'], p['nick'])}")
+            else:
+                lines.append("  Отсутствуют")
             lines.append("")
         return "\n".join(lines)
 
@@ -1119,7 +1141,9 @@ def handle_command(text, from_user_id, peer_id, storage, vk, get_user_name,
         net_name, _ = storage.find_network_by_chat(peer_id)
         chat_type = storage.get_chat_type(peer_id)
         net_str = f"Сетка: {net_name}" if net_name else "Сетка: не задана"
-        return f"peer_id: {peer_id}\nТип: {chat_type}\n{net_str}"
+        active = "✅ активна" if storage.is_chat_active(peer_id) else "❌ не активирована"
+        silence = "🔇 тишина включена" if storage.is_silence(peer_id) else ""
+        return f"peer_id: {peer_id}\nТип: {chat_type}\n{net_str}\nСтатус: {active} {silence}"
 
     if cmd in ("/type", "!type"):
         if not is_moder and not is_owner:
@@ -1167,15 +1191,22 @@ def handle_command(text, from_user_id, peer_id, storage, vk, get_user_name,
         if not is_moder and not is_owner:
             return no_access()
         return (
-            "📋 Команды модерации:\n\n"
+            "📋 Команды:\n\n"
             "🛡 Модерация:\n"
             "/ban /unban /kick /gban /ungban\n"
             "/мут /размут /warn /warns /clearwarns\n"
-            "/checkban /mstats /stats\n\n"
+            "/checkban /mstats /stats\n"
+            "/чистка [кол-во] — удалить сообщения\n\n"
             "👥 Стафф:\n"
             "/staff /mstaff /gstaff\n"
-            "/snick /rnick /delstaff\n"
+            "/snick /rnick /delstaff /уволить\n"
             "/ср /зср /рс /рм /зрм /гм /згм /км /са /мод /мм\n\n"
+            "⚙️ Беседа:\n"
+            "/start — активировать бота (РС+)\n"
+            "/тишина — режим тишины (РС+)\n"
+            "/зов [причина] — вызвать всех (ЗРМ+)\n"
+            "/demote — расформировать (владелец)\n"
+            "/рассылка [текст] — рассылка (владелец)\n\n"
             "🎮 Игры: /gamehelp\n"
             "🍺 Пиво: /пиво /пивозавры\n"
         )
