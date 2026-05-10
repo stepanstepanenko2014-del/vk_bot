@@ -33,20 +33,25 @@ def db_get():
             data.setdefault("chat_types", {})
             data.setdefault("mutes", {})
             data.setdefault("beer", {})
+            data.setdefault("economy", {})
+            data.setdefault("duels", {})
+            data.setdefault("promos", {})
+            data.setdefault("charity", {})
             return data
     except Exception as e:
         print(f"[DB] get error: {e}")
     return {
         "messages": {}, "moderators": {}, "warnings": {},
         "networks": {}, "admins": {}, "bans": {}, "gbans": {},
-        "chat_types": {}, "mutes": {}, "beer": {}
+        "chat_types": {}, "mutes": {}, "beer": {},
+        "economy": {}, "duels": {}, "promos": {}, "charity": {}
     }
 
 
 def db_save(data):
     try:
         payload = {"key": "main", "value": json.dumps(data, ensure_ascii=False)}
-        r = requests.post(
+        requests.post(
             f"{SUPABASE_URL}/rest/v1/bot_data",
             headers={**HEADERS, "Prefer": "resolution=merge-duplicates"},
             json=payload
@@ -55,12 +60,37 @@ def db_save(data):
         print(f"[DB] save error: {e}")
 
 
+def default_economy():
+    return {
+        "balance": 0,
+        "bank": 0,
+        "vip": False,
+        "vip_until": None,
+        "hide_balance": False,
+        "prize_last": None,
+        "deposit": None,  # {"amount": N, "rate": 0.03, "until": "...", "opened": "..."}
+        "businesses": [],  # [{"type": "завод", "bought": "...", "products": N, "products_last": "..."}]
+        "charity_total": 0,
+        "kicks": 0,
+    }
+
+
 class Storage:
     def __init__(self):
         self.data = db_get()
 
     def _save(self):
         db_save(self.data)
+
+    def _eco(self, user_id: int) -> dict:
+        uid = str(user_id)
+        if uid not in self.data["economy"]:
+            self.data["economy"][uid] = default_economy()
+        eco = self.data["economy"][uid]
+        # Обеспечиваем все поля
+        for k, v in default_economy().items():
+            eco.setdefault(k, v)
+        return eco
 
     # ── Сообщения ──
     def count_message(self, user_id: int, peer_id: int):
@@ -79,13 +109,10 @@ class Storage:
         today = datetime.now().strftime("%Y-%m-%d")
         week_days = [(datetime.now() - timedelta(days=i)).strftime("%Y-%m-%d") for i in range(7)]
         month_days = [(datetime.now() - timedelta(days=i)).strftime("%Y-%m-%d") for i in range(30)]
-
         if uid not in self.data["messages"]:
             return {"total": 0, "today": 0, "week": 0, "month": 0, "last_time": None}
-
         total = today_count = week_count = month_count = 0
         last_time = None
-
         for pid, counts in self.data["messages"][uid].items():
             if peer_ids is not None and int(pid) not in peer_ids:
                 continue
@@ -98,11 +125,8 @@ class Storage:
             lt = counts.get("last_time")
             if lt and (last_time is None or lt > last_time):
                 last_time = lt
-
-        return {
-            "total": total, "today": today_count,
-            "week": week_count, "month": month_count, "last_time": last_time
-        }
+        return {"total": total, "today": today_count, "week": week_count,
+                "month": month_count, "last_time": last_time}
 
     def get_user_stats_in_chat(self, user_id: int, peer_id: int):
         uid, pid = str(user_id), str(peer_id)
@@ -110,11 +134,8 @@ class Storage:
         if uid not in self.data["messages"] or pid not in self.data["messages"][uid]:
             return {"total": 0, "today": 0, "last_time": None}
         d = self.data["messages"][uid][pid]
-        return {
-            "total": d.get("total", 0),
-            "today": d.get(today, 0),
-            "last_time": d.get("last_time")
-        }
+        return {"total": d.get("total", 0), "today": d.get(today, 0),
+                "last_time": d.get("last_time")}
 
     def get_chat_stats(self, peer_id: int, days: int = 7):
         pid = str(peer_id)
@@ -342,9 +363,6 @@ class Storage:
                 return m
         return None
 
-    def get_all_mutes(self):
-        return self.data.get("mutes", {})
-
     # ── Пиво ──
     def add_beer(self, user_id: int, amount: float):
         uid = str(user_id)
@@ -352,8 +370,7 @@ class Storage:
         self.data["beer"].setdefault(uid, {"total": 0, "month": {}, "last_time": None})
         self.data["beer"][uid]["total"] = round(self.data["beer"][uid].get("total", 0) + amount, 1)
         self.data["beer"][uid]["month"][month] = round(
-            self.data["beer"][uid]["month"].get(month, 0) + amount, 1
-        )
+            self.data["beer"][uid]["month"].get(month, 0) + amount, 1)
         self.data["beer"][uid]["last_time"] = datetime.now().strftime("%Y-%m-%d %H:%M")
         self._save()
 
@@ -376,3 +393,327 @@ class Storage:
     def reset_beer(self):
         self.data["beer"] = {}
         self._save()
+
+    # ══════════════════════════════════════
+    # ── ЭКОНОМИКА ──
+    # ══════════════════════════════════════
+
+    def get_balance(self, user_id: int) -> int:
+        return self._eco(user_id)["balance"]
+
+    def get_bank(self, user_id: int) -> int:
+        return self._eco(user_id)["bank"]
+
+    def add_balance(self, user_id: int, amount: int):
+        eco = self._eco(user_id)
+        eco["balance"] = max(0, eco["balance"] + amount)
+        self._save()
+
+    def set_balance(self, user_id: int, amount: int):
+        self._eco(user_id)["balance"] = max(0, amount)
+        self._save()
+
+    def transfer(self, from_id: int, to_id: int, amount: int) -> bool:
+        eco_from = self._eco(from_id)
+        if eco_from["balance"] < amount:
+            return False
+        eco_from["balance"] -= amount
+        self._eco(to_id)["balance"] += amount
+        self._save()
+        return True
+
+    def deposit_to_bank(self, user_id: int, amount: int) -> bool:
+        eco = self._eco(user_id)
+        if eco["balance"] < amount:
+            return False
+        eco["balance"] -= amount
+        eco["bank"] += amount
+        self._save()
+        return True
+
+    def withdraw_from_bank(self, user_id: int, amount: int) -> bool:
+        eco = self._eco(user_id)
+        if eco["bank"] < amount:
+            return False
+        eco["bank"] -= amount
+        eco["balance"] += amount
+        self._save()
+        return True
+
+    def is_vip(self, user_id: int) -> bool:
+        return self._eco(user_id).get("vip", False)
+
+    def buy_vip(self, user_id: int, price: int) -> bool:
+        eco = self._eco(user_id)
+        if eco["balance"] < price:
+            return False
+        eco["balance"] -= price
+        eco["vip"] = True
+        self._save()
+        return True
+
+    def has_hide_balance(self, user_id: int) -> bool:
+        return self._eco(user_id).get("hide_balance", False)
+
+    def buy_hide_balance(self, user_id: int, price: int) -> bool:
+        eco = self._eco(user_id)
+        if eco["balance"] < price or eco.get("hide_balance"):
+            return False
+        eco["balance"] -= price
+        eco["hide_balance"] = True
+        self._save()
+        return True
+
+    def toggle_hide_balance(self, user_id: int) -> bool:
+        eco = self._eco(user_id)
+        if not eco.get("hide_balance"):
+            return False
+        eco["hide_balance_active"] = not eco.get("hide_balance_active", False)
+        self._save()
+        return eco["hide_balance_active"]
+
+    def get_prize_last(self, user_id: int):
+        return self._eco(user_id).get("prize_last")
+
+    def claim_prize(self, user_id: int, amount: int):
+        eco = self._eco(user_id)
+        eco["prize_last"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        eco["balance"] += amount
+        self._save()
+
+    # ── Депозит (VIP) ──
+    def open_deposit(self, user_id: int, amount: int, rate: float, days: int) -> bool:
+        eco = self._eco(user_id)
+        if eco["balance"] < amount or eco.get("deposit"):
+            return False
+        eco["balance"] -= amount
+        until = (datetime.now() + timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
+        eco["deposit"] = {
+            "amount": amount,
+            "rate": rate,
+            "until": until,
+            "opened": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        }
+        self._save()
+        return True
+
+    def close_deposit(self, user_id: int) -> dict | None:
+        eco = self._eco(user_id)
+        dep = eco.get("deposit")
+        if not dep:
+            return None
+        until = datetime.strptime(dep["until"], "%Y-%m-%d %H:%M:%S")
+        now = datetime.now()
+        if now < until:
+            # Досрочно — возвращаем без процентов
+            earned = 0
+        else:
+            earned = int(dep["amount"] * dep["rate"])
+        eco["balance"] += dep["amount"] + earned
+        eco["deposit"] = None
+        self._save()
+        return {"amount": dep["amount"], "earned": earned, "early": now < until}
+
+    def get_deposit(self, user_id: int):
+        return self._eco(user_id).get("deposit")
+
+    # ── Бизнес ──
+    def buy_business(self, user_id: int, biz_type: str, price: int) -> bool:
+        eco = self._eco(user_id)
+        if eco["balance"] < price:
+            return False
+        eco["balance"] -= price
+        eco["businesses"].append({
+            "type": biz_type,
+            "bought": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "products": 0,
+            "products_last": None,
+            "balance": 0,
+        })
+        self._save()
+        return True
+
+    def get_businesses(self, user_id: int) -> list:
+        return self._eco(user_id).get("businesses", [])
+
+    def add_products(self, user_id: int, biz_index: int, products: int, cost: int) -> bool:
+        eco = self._eco(user_id)
+        bizs = eco.get("businesses", [])
+        if biz_index >= len(bizs) or eco["balance"] < cost:
+            return False
+        eco["balance"] -= cost
+        bizs[biz_index]["products"] += products
+        self._save()
+        return True
+
+    def collect_business(self, user_id: int) -> int:
+        """Собирает доход со всех бизнесов. Возвращает сумму."""
+        from economy import BUSINESS
+        eco = self._eco(user_id)
+        total_income = 0
+        now = datetime.now()
+        for biz in eco.get("businesses", []):
+            biz_info = BUSINESS.get(biz["type"])
+            if not biz_info or biz["products"] <= 0:
+                continue
+            last = biz.get("products_last")
+            if last:
+                last_dt = datetime.strptime(last, "%Y-%m-%d %H:%M:%S")
+                hours = (now - last_dt).total_seconds() / 3600
+            else:
+                hours = 0
+            if hours >= 1:
+                # Доход пропорционален времени, но не больше чем хватает продуктов
+                max_hours = biz["products"] / (biz_info["products_per_day"] / 24)
+                worked_hours = min(hours, max_hours)
+                income = int(biz_info["income"] / 24 * worked_hours)
+                products_used = int(biz_info["products_per_day"] / 24 * worked_hours)
+                biz["balance"] = biz.get("balance", 0) + income
+                biz["products"] = max(0, biz["products"] - products_used)
+                biz["products_last"] = now.strftime("%Y-%m-%d %H:%M:%S")
+        # Снимаем накопленный баланс
+        for biz in eco.get("businesses", []):
+            total_income += biz.get("balance", 0)
+            biz["balance"] = 0
+        eco["balance"] += total_income
+        self._save()
+        return total_income
+
+    def sell_businesses(self, user_id: int) -> int:
+        """Продаёт все бизнесы государству за 50% цены."""
+        from economy import BUSINESS
+        eco = self._eco(user_id)
+        total = 0
+        for biz in eco.get("businesses", []):
+            price = BUSINESS.get(biz["type"], {}).get("price", 0)
+            total += price // 2
+        eco["businesses"] = []
+        eco["balance"] += total
+        self._save()
+        return total
+
+    def sell_business_to_user(self, from_id: int, to_id: int, biz_index: int, price: int) -> bool:
+        eco_from = self._eco(from_id)
+        eco_to = self._eco(to_id)
+        bizs = eco_from.get("businesses", [])
+        if biz_index >= len(bizs) or eco_to["balance"] < price:
+            return False
+        biz = bizs.pop(biz_index)
+        eco_to["businesses"].append(biz)
+        eco_to["balance"] -= price
+        eco_from["balance"] += price
+        self._save()
+        return True
+
+    # ── Рулетка ──
+    def roulette(self, user_id: int, bet: int) -> dict:
+        from economy import ROULETTE_MIN
+        eco = self._eco(user_id)
+        if eco["balance"] < bet or bet < ROULETTE_MIN:
+            return {"ok": False}
+        import random
+        eco["balance"] -= bet
+        # 45% выигрыш x2, 5% x5, 50% проигрыш
+        roll = random.random()
+        if roll < 0.05:
+            win = bet * 5
+            result = "джекпот"
+        elif roll < 0.45:
+            win = bet * 2
+            result = "победа"
+        else:
+            win = 0
+            result = "проигрыш"
+        eco["balance"] += win
+        self._save()
+        return {"ok": True, "bet": bet, "win": win, "result": result}
+
+    # ── Благотворительность ──
+    def donate_charity(self, user_id: int, amount: int) -> bool:
+        eco = self._eco(user_id)
+        if eco["balance"] < amount:
+            return False
+        eco["balance"] -= amount
+        eco["charity_total"] = eco.get("charity_total", 0) + amount
+        self.data["charity"][str(user_id)] = eco["charity_total"]
+        self._save()
+        return True
+
+    def get_charity_top(self) -> list:
+        result = [{"user_id": int(uid), "amount": amt}
+                  for uid, amt in self.data["charity"].items()]
+        return sorted(result, key=lambda x: x["amount"], reverse=True)
+
+    # ── Промокоды ──
+    def create_promo(self, code: str, amount: int, max_uses: int, creator_id: int) -> bool:
+        if code in self.data["promos"]:
+            return False
+        self.data["promos"][code] = {
+            "amount": amount,
+            "max_uses": max_uses,
+            "uses": 0,
+            "activated_by": [],
+            "creator": creator_id,
+            "created": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        }
+        self._save()
+        return True
+
+    def activate_promo(self, user_id: int, code: str) -> dict:
+        promo = self.data["promos"].get(code)
+        if not promo:
+            return {"ok": False, "reason": "not_found"}
+        if user_id in promo["activated_by"]:
+            return {"ok": False, "reason": "already_used"}
+        if promo["uses"] >= promo["max_uses"]:
+            return {"ok": False, "reason": "expired"}
+        promo["uses"] += 1
+        promo["activated_by"].append(user_id)
+        self._eco(user_id)["balance"] += promo["amount"]
+        self._save()
+        return {"ok": True, "amount": promo["amount"]}
+
+    def get_user_promos(self, user_id: int) -> list:
+        result = []
+        for code, p in self.data["promos"].items():
+            if user_id in p.get("activated_by", []):
+                result.append({"code": code, "amount": p["amount"]})
+        return result
+
+    def get_eco(self, user_id: int) -> dict:
+        return self._eco(user_id)
+
+    def get_rich_top(self) -> list:
+        result = []
+        for uid, eco in self.data["economy"].items():
+            total = eco.get("balance", 0) + eco.get("bank", 0)
+            result.append({"user_id": int(uid), "balance": eco.get("balance", 0),
+                           "bank": eco.get("bank", 0), "total": total})
+        return sorted(result, key=lambda x: x["total"], reverse=True)
+
+    # ── Дуэли ──
+    def create_duel(self, duel_id: str, creator_id: int, amount: int, peer_id: int):
+        self.data["duels"][duel_id] = {
+            "creator": creator_id,
+            "amount": amount,
+            "peer_id": peer_id,
+            "created": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "active": True
+        }
+        self._save()
+
+    def get_duel(self, duel_id: str):
+        return self.data["duels"].get(duel_id)
+
+    def close_duel(self, duel_id: str):
+        if duel_id in self.data["duels"]:
+            self.data["duels"][duel_id]["active"] = False
+            self._save()
+
+    # ── Пнуть ──
+    def add_kick(self, user_id: int):
+        self._eco(user_id)["kicks"] = self._eco(user_id).get("kicks", 0) + 1
+        self._save()
+
+    def get_kicks(self, user_id: int) -> int:
+        return self._eco(user_id).get("kicks", 0)
