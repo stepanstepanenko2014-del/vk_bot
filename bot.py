@@ -160,6 +160,8 @@ def webhook():
             return CONFIRMATION_CODE
         if event_type == "message_new":
             process_message(data)
+        if event_type == "message_event":
+            handle_callback(data)
         return "ok"
     except Exception as e:
         print(f"[ERROR] webhook: {e}")
@@ -175,6 +177,66 @@ def ping():
 def health():
     return "Bot is running", 200
 
+def handle_callback(data: dict):
+    try:
+        import json, random
+        obj = data.get("object", {})
+        payload = obj.get("payload", {})
+        if isinstance(payload, str):
+            payload = json.loads(payload)
+        
+        cmd = payload.get("cmd")
+        user_id = obj.get("user_id")
+        peer_id = obj.get("peer_id")
+        event_id = obj.get("event_id")
+
+        # Отвечаем на callback чтобы кнопка не висела
+        try:
+            vk.messages.sendMessageEventAnswer(
+                event_id=event_id,
+                user_id=user_id,
+                peer_id=peer_id,
+                event_data=json.dumps({"type": "show_snackbar", "text": "✅"})
+            )
+        except Exception as e:
+            print(f"[WARN] event answer: {e}")
+
+        if cmd == "duel_join":
+            duel_id = payload.get("duel_id")
+            duel = storage.get_duel(duel_id)
+            if not duel or not duel.get("active"):
+                send_message(peer_id, "❌ Дуэль уже завершена или не найдена.")
+                return
+            if duel["creator"] == user_id:
+                send_message(peer_id, "❌ Нельзя вступить в свою дуэль.")
+                return
+            if storage.get_balance(user_id) < duel["amount"]:
+                send_message(peer_id, f"❌ Недостаточно монет для вступления в дуэль.")
+                return
+
+            storage.add_balance(user_id, -duel["amount"])
+            storage.close_duel(duel_id)
+
+            # Определяем победителя
+            winner_id = random.choice([duel["creator"], user_id])
+            loser_id = user_id if winner_id == duel["creator"] else duel["creator"]
+            prize = duel["amount"] * 2
+            storage.add_balance(winner_id, prize)
+
+            mod_w = storage.get_moderator(winner_id)
+            name_w = mod_w["nick"] if mod_w else get_user_name(winner_id)
+            mod_l = storage.get_moderator(loser_id)
+            name_l = mod_l["nick"] if mod_l else get_user_name(loser_id)
+
+            from economy import fmt, CURRENCY
+            send_message(peer_id,
+                f"⚔️ Дуэль завершена!\n\n"
+                f"🏆 Победитель: {make_mention(winner_id, name_w)}\n"
+                f"💀 Проигравший: {make_mention(loser_id, name_l)}\n"
+                f"💰 Приз: {fmt(prize)} {CURRENCY}"
+            )
+    except Exception as e:
+        print(f"[ERROR] handle_callback: {e}")
 
 if __name__ == "__main__":
     print("[BOT] Starting (Callback)...")
