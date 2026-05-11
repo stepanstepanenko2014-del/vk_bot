@@ -165,9 +165,6 @@ def handle_callback(data: dict):
 
 def process_message(data: dict):
     try:
-        # Перезагружаем данные из БД при каждом сообщении — фикс сброса данных
-        storage.data = db_get()
-
         obj = data.get("object", {})
         msg = obj.get("message", obj)
 
@@ -178,13 +175,17 @@ def process_message(data: dict):
         if not peer_id or not user_id or user_id <= 0:
             return
 
-        # Служебные действия
+        # Служебные действия — до перезагрузки БД
         action = msg.get("action", {})
         if action.get("type") == "chat_invite_user":
+            storage.data = db_get()
             invited_id = action.get("member_id", 0)
             if invited_id > 0 and peer_id > 2000000000:
                 handle_invite(peer_id, invited_id, user_id)
             return
+
+        # Перезагружаем данные из БД перед обработкой
+        storage.data = db_get()
 
         # Проверяем активна ли беседа
         if peer_id > 2000000000 and not storage.is_chat_active(peer_id):
@@ -195,9 +196,6 @@ def process_message(data: dict):
                     send_message(peer_id, "✅ Бот активирован в этой беседе!")
                 else:
                     send_message(peer_id, "⛔ Активация доступна с должности Руководитель сообщества.")
-            # Не делаем return — если хочешь чтобы команды работали без активации
-            # Если нужна строгая активация — раскомментируй строку ниже:
-            # return
 
         # Считаем сообщения
         if peer_id > 2000000000:
